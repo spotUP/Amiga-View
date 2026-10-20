@@ -81,7 +81,11 @@ struct stk1160_buffer {
 	 * Since we interlace two fields per frame,
 	 * this is different from bytesused.
 	 */
-	unsigned int pos;		/* current pos inside buffer */
+	unsigned int pos;		/* current pos inside the field */
+
+	/* packets lost in the current field and the field byte of the first */
+	unsigned int holes;
+	unsigned int hole_pos;
 };
 
 struct stk1160_urb {
@@ -107,6 +111,7 @@ struct stk1160_isoc_ctl {
 	/* video payload of the last good packet, and packets lost in a field */
 	int last_payload;
 	unsigned int lost_pkts;
+	unsigned int fixed_fields;
 };
 
 struct stk1160_fmt {

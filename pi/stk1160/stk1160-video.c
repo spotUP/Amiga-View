@@ -16,10 +16,17 @@
 #include <linux/ratelimit.h>
 
 #include "stk1160.h"
+#include "stk1160-fieldfix.h"
 
 static unsigned int debug;
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "enable debug messages");
+
+/* Totals since module load, readable in /sys/module/stk1160/parameters */
+static unsigned int total_lost_pkts, total_fixed_fields, total_unfixed_fields;
+module_param_named(lost_total, total_lost_pkts, uint, 0444);
+module_param_named(fixed_total, total_fixed_fields, uint, 0444);
+module_param_named(unfixed_total, total_unfixed_fields, uint, 0444);
 
 static inline void print_err_status(struct stk1160 *dev,
 				     int packet, int status)
@@ -81,11 +88,49 @@ struct stk1160_buffer *stk1160_next_buffer(struct stk1160 *dev)
 	return buf;
 }
 
+/*
+ * A field ended. If exactly one packet was lost in it, the lost packet's
+ * size is the field shortfall: move the data after the hole later by it.
+ */
+static void stk1160_field_end(struct stk1160 *dev)
+{
+	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
+	unsigned int bpl = dev->width * 2;
+	unsigned int field_size = bpl * (dev->height / 2);
+	unsigned int shift;
+
+	if (buf->holes == 1) {
+		shift = stk1160_fix_field(buf->mem, bpl, buf->odd, field_size,
+					  buf->hole_pos, buf->pos,
+					  dev->isoc_ctl.max_pkt_size - 4);
+		if (shift) {
+			buf->bytesused += shift;
+			dev->isoc_ctl.fixed_fields++;
+			total_fixed_fields++;
+		} else {
+			total_unfixed_fields++;
+		}
+		dev_dbg_ratelimited(dev->dev,
+			"field end: hole at %u, shortfall %u, %s (lost %u, corrected %u)\n",
+			buf->hole_pos, field_size - min(field_size, buf->pos),
+			shift ? "corrected" : "left", dev->isoc_ctl.lost_pkts,
+			dev->isoc_ctl.fixed_fields);
+	} else if (buf->holes) {
+		total_unfixed_fields++;
+		dev_dbg_ratelimited(dev->dev,
+			"field end: %u holes, left (lost %u, corrected %u)\n",
+			buf->holes, dev->isoc_ctl.lost_pkts,
+			dev->isoc_ctl.fixed_fields);
+	}
+	buf->holes = 0;
+}
+
 static inline
 void stk1160_buffer_done(struct stk1160 *dev)
 {
 	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
 
+	stk1160_field_end(dev);
 	buf->vb.sequence = dev->sequence++;
 	buf->vb.field = V4L2_FIELD_INTERLACED;
 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
@@ -99,7 +144,7 @@ void stk1160_buffer_done(struct stk1160 *dev)
 static inline
 void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 {
-	int linesdone, lineoff, lencopy, offset;
+	int lencopy, offset;
 	int bytesperline = dev->width * 2;
 	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
 	u8 *dst = buf->mem;
@@ -120,17 +165,10 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 
 	remain = len;
 
-	linesdone = buf->pos / bytesperline;
-	lineoff = buf->pos % bytesperline; /* offset in current line */
-
-	if (!buf->odd)
-		dst += bytesperline;
-
-	/* Multiply linesdone by two, to take account of the other field */
-	dst += linesdone * bytesperline * 2 + lineoff;
+	dst += stk1160_field_addr(bytesperline, buf->odd, buf->pos);
 
 	/* Copy the remaining of current line */
-	lencopy = min(remain, bytesperline - lineoff);
+	lencopy = min(remain, bytesperline - (int)(buf->pos % bytesperline));
 
 	/*
 	 * Check if we have enough space left in the buffer.
@@ -218,26 +256,20 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
  * Controls the isoc copy of each urb packet
  */
 /*
- * A packet was lost inside a field (isoc error status). Keep the hole where
- * it belongs by advancing the position by the payload the packet would have
- * carried, so the rest of the field is not shifted up by one packet.
- * The pixels of the hole keep what the buffer held before.
+ * A packet was lost inside a field. Its size is unknown here (the device
+ * mixes 3072 and 2048 byte packets), so do not move pos: record the hole and
+ * let stk1160_field_end() repair the field from the measured shortfall.
  */
-static void stk1160_skip_video(struct stk1160 *dev, int len)
+static void stk1160_skip_video(struct stk1160 *dev)
 {
 	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
 
-	/* A field is half of the buffer */
-	if (buf->pos >= buf->length / 2)
-		return;
-	len = min_t(unsigned int, len, buf->length / 2 - buf->pos);
-
-	buf->pos += len;
-	buf->bytesused += len;
-
 	dev->isoc_ctl.lost_pkts++;
-	dev_dbg_ratelimited(dev->dev, "lost packet kept as a hole, %u so far\n",
-			    dev->isoc_ctl.lost_pkts);
+	total_lost_pkts++;
+	if (buf->holes++ == 0)
+		buf->hole_pos = buf->pos;
+	dev_dbg_ratelimited(dev->dev, "lost packet, hole at %u, %u so far\n",
+			    buf->hole_pos, dev->isoc_ctl.lost_pkts);
 }
 
 static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
@@ -260,8 +292,8 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 		status = urb->iso_frame_desc[i].status;
 		if (status < 0) {
 			print_err_status(dev, i, status);
-			if (dev->isoc_ctl.buf && dev->isoc_ctl.last_payload > 0)
-				stk1160_skip_video(dev, dev->isoc_ctl.last_payload);
+			if (dev->isoc_ctl.buf)
+				stk1160_skip_video(dev);
 			continue;
 		}
 
@@ -307,8 +339,11 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 			/* We set next packet parity and
 			 * continue to get next one
 			 */
+			if (p[0] == 0x80)
+				stk1160_field_end(dev);
 			dev->isoc_ctl.buf->odd = *p & 0x40;
 			dev->isoc_ctl.buf->pos = 0;
+			dev->isoc_ctl.buf->holes = 0;
 			continue;
 		}
 

@@ -153,3 +153,31 @@ and add `deficit` to `bytesused`. Exact for any lost size; at most one field mem
 loss, ~10/s. More than one loss in a field or a bigger deficit: leave as is (rare). The cheaper
 "skip 2044" variant matches today's measurements only by coincidence of the device's packet mix.
 Upstream cause (VL805 xHCI misses the 2048-byte packet in slot 42) still not investigated.
+
+## Shortfall fix (installed 2026-10-21 ~00:55)
+
+Replaces the 3068-byte guess. On a lost packet the driver no longer moves `pos`; it records `holes`
+and `hole_pos` per field. At field end (0x80 marker, and `stk1160_buffer_done` for the second field)
+`stk1160_field_end()` computes shortfall = bpl*(height/2) - pos; with exactly one hole and
+1 <= shortfall <= max_pkt_size-4 it moves the bytes after the hole later by the shortfall
+(`stk1160_fix_field()` in `pi/stk1160/stk1160-fieldfix.h`, backwards, interleaved mapping shared with
+`stk1160_copy_video` via `stk1160_field_addr()`) and adds the shortfall to `bytesused`.
+Host test `pi/stk1160/fieldfix_test.c`: 10 cases (5 hole offsets, both parities) all correct with the fix;
+the old skip model misplaces 5693..412672 bytes per case.
+
+Pi: srcversion DF9F29A103C21784221566B -> 21ACE068F5BBA68C50E48BC. The kernel has no dynamic debug, so
+counters are exposed as read-only module parameters (`lost_total`, `fixed_total`, `unfixed_total`
+in /sys/module/stk1160/parameters). Measured over 5 s windows (no restart between):
+
+| Window | parts | lost | corrected | left unfixed | short_frames delta |
+|---|---|---|---|---|---|
+| 1 | 250 | 131 | 127 | 2 | 2 |
+| 2 | 250 | 126 | 126 | 0 | 0 |
+| 3 | 249 | 129 | 129 | 0 | 0 |
+| 4 | 250 | 128 | 129 | 0 | 0 |
+| 5 | 250 | 128 | 126 | 1 | 0 |
+
+(Counts are approximate to +-1 because the reads race the stream.) About 98% of lost packets are
+corrected; the 1-2 per 5 s left unfixed (2+ holes or shortfall out of range) still yield a short
+frame (short_frames rose 1 -> 6 over ~35 s). Not done: the usbmon field-total check (corrected fields
+ending at 414720 is inferred from short_frames = 0 in clean windows). Open: the unfixed cases.
