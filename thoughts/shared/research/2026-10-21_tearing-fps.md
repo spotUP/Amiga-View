@@ -72,3 +72,29 @@ guessing where the packet went missing.
 ## Owner eye-check
 - Motion should look smoother (50 distinct fields/s instead of ~34).
 - Tearing remains: a horizontal shear band that crawls down the picture, in ~3 of 4 frames.
+
+## Kernel fix for the tear: patched stk1160 (built, NOT installed)
+
+Source: `pi/stk1160/`, stock files from raspberrypi/linux tag `stable_20260911` (matches the
+running `6.18.50+rpt-rpi-v8`, built 2026-09-11, package 1:6.18.50-1+rpt1); first commit is the
+pristine copy, the next is the patch (`git diff` of the two shows the whole change).
+Change: `stk1160_process_isoc` on an errored packet inside a field calls `stk1160_skip_video`,
+which advances `buf->pos` and `bytesused` by the last good packet's payload (`len - 4`, 2044
+measured), so the rest of the field stays in place and only a stale strip remains. Counter
+`isoc_ctl.lost_pkts`, printed rate-limited with `dev_dbg` (enable via dynamic debug).
+
+Status: compiled on the Pi (no warnings, `~/stk1160-build/stk1160.ko`). Install and the
+before/after measurement were NOT done: `sudo` on the Pi needs a password (`sudo -n` refused), and
+installing a module needs root.
+
+Install by hand on the Pi (one time per kernel):
+```
+cd ~/stk1160-build && make && systemctl --user stop amiga-cam \
+ && sudo mkdir -p /lib/modules/$(uname -r)/updates && sudo cp stk1160.ko /lib/modules/$(uname -r)/updates/ \
+ && sudo depmod -a && sudo modprobe -r stk1160 && sudo modprobe stk1160 \
+ && /sbin/modinfo stk1160 | head -3 && systemctl --user start amiga-cam
+```
+Revert: `sudo rm /lib/modules/$(uname -r)/updates/stk1160.ko && sudo depmod -a`, reload the module.
+After a kernel update (apt): the new kernel has its own modules dir, so the patched module is
+not used; fetch the matching tag's driver files into `pi/stk1160/`, re-apply the patch, then
+repeat the command above (headers package must match: `sudo apt install linux-headers-$(uname -r)`).
