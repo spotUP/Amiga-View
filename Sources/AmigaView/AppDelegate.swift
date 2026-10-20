@@ -71,10 +71,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard SynergySwitch.shouldSend(enabled: SynergySwitch.isEnabled(), trusted: accessibilityTrusted,
                                        lastSent: lastSwitch, now: now) else { return }
         lastSwitch = now
-        for down in [true, false] {
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: SynergySwitch.keyCode, keyDown: down) else { continue }
-            event.flags = SynergySwitch.flags
-            event.post(tap: .cghidEventTap)
+        guard let pointer = CGEvent(source: nil)?.location else { return }
+        var count: UInt32 = 0
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetActiveDisplayList(UInt32(ids.count), &ids, &count) == .success, count > 0 else { return }
+        let desktop = ids.prefix(Int(count)).map(CGDisplayBounds).reduce(CGRect.null) { $0.union($1) }
+        for point in SynergySwitch.edgePath(from: pointer, desktop: desktop) {
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            usleep(20_000)
         }
     }
 

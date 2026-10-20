@@ -2,12 +2,20 @@ import XCTest
 @testable import AmigaViewCore
 
 final class SynergySwitchTests: XCTestCase {
-    /// The Deskflow app on macOS records Command as "Control" and Control as "Meta", and
-    /// deskflow-core has no Mac key for Meta, so the hotkey it actually registers is
-    /// Control+Option+F12; a posted Command would keep it from matching.
-    func testHotkeyIsControlOptionF12() {
-        XCTAssertEqual(SynergySwitch.keyCode, 0x6F)
-        XCTAssertEqual(SynergySwitch.flags, [.maskControl, .maskAlternate])
+    /// Deskflow ignores a posted hotkey, so the switch walks the pointer across the right
+    /// edge of the desktop ("replay" is right of the Mac), keeping the pointer's height.
+    func testEdgePathCrossesTheRightEdge() {
+        let desktop = CGRect(x: 0, y: 0, width: 1800, height: 1169)
+        let path = SynergySwitch.edgePath(from: CGPoint(x: 1022, y: 390), desktop: desktop)
+        XCTAssertEqual(path.map(\.x), [1780, 1785, 1790, 1795, 1800, 1805])
+        XCTAssertEqual(Set(path.map(\.y)), [390])
+    }
+
+    func testEdgePathKeepsTheHeightOnTheDesktop() {
+        let desktop = CGRect(x: -1440, y: 0, width: 3240, height: 1169)
+        let path = SynergySwitch.edgePath(from: CGPoint(x: 10, y: 1500), desktop: desktop)
+        XCTAssertEqual(path.last?.x, 1805)
+        XCTAssertEqual(Set(path.map(\.y)), [1168])
     }
 
     func testEnabledByDefaultAndStored() {

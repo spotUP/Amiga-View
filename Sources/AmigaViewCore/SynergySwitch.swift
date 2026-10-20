@@ -1,13 +1,13 @@
 import CoreGraphics
 import Foundation
 
-/// The global hotkey Deskflow binds to switchToScreen(replay): Control+Option+F12.
-/// Recorded in the Deskflow app as Control+Option+Command+F12, it is saved as
-/// Meta+Alt+Control+F12, and deskflow-core on macOS registers that as Control+Option+F12
-/// (Meta has no Mac key); posting Command as well would keep the hotkey from matching.
+/// Moves Deskflow's keyboard and mouse to the Amiga ("replay", right of the Mac) on a click.
+/// Deskflow does not react to a posted hotkey (synthetic keys never trigger its
+/// switchToScreen keystroke, even with real modifier key-downs), but it does switch on
+/// posted mouse moves that cross the screen edge, so the switch walks the pointer there.
 public enum SynergySwitch {
-    public static let keyCode: CGKeyCode = 0x6F // kVK_F12
-    public static let flags: CGEventFlags = [.maskControl, .maskAlternate]
+    public static let edgeApproach: CGFloat = 20
+    public static let edgeStep: CGFloat = 5
     public static let debounce: TimeInterval = 0.5
     public static let defaultsKey = "switchSynergyOnClick"
     public static let untrustedStatus = "Grant Accessibility to switch Synergy on click"
@@ -21,7 +21,15 @@ public enum SynergySwitch {
         store.set(on, forKey: defaultsKey)
     }
 
-    /// Whether a click at `now` should post the hotkey. `lastSent` is the time of the previous post.
+    /// The pointer positions to post: from just inside the right edge of `desktop` (the union of
+    /// the displays, in CoreGraphics coordinates) to just past it, at the pointer's height.
+    public static func edgePath(from pointer: CGPoint, desktop: CGRect) -> [CGPoint] {
+        let y = min(max(pointer.y, desktop.minY), desktop.maxY - 1)
+        return stride(from: desktop.maxX - edgeApproach, through: desktop.maxX + edgeStep, by: edgeStep)
+            .map { CGPoint(x: $0, y: y) }
+    }
+
+    /// Whether a click at `now` should switch. `lastSent` is the time of the previous switch.
     public static func shouldSend(enabled: Bool, trusted: Bool, lastSent: TimeInterval?, now: TimeInterval) -> Bool {
         guard enabled, trusted else { return false }
         guard let lastSent else { return true }

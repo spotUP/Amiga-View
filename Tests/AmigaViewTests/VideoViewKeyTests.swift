@@ -17,8 +17,8 @@ final class VideoViewKeyTests: XCTestCase {
                          isARepeat: false, keyCode: 0)!
     }
 
-    /// A key passed up the chain ends at noResponder, which beeps (typing, and the
-    /// Control+Option+F12 a click posts for Synergy).
+    /// A key passed up the chain ends at noResponder, which beeps (typing, and
+    /// any shortcut pressed while the window is key).
     func testKeysStopAtTheVideoView() {
         let view = VideoView(frame: .zero)
         let spy = ChainSpy()
@@ -27,5 +27,20 @@ final class VideoViewKeyTests: XCTestCase {
         view.keyDown(with: key(.keyDown, flags: [.control, .option]))
         view.keyUp(with: key(.keyUp))
         XCTAssertEqual(spy.passed, [])
+    }
+
+    /// Deskflow keeps input on the Mac while a button is held, so the switch fires on release.
+    func testClickSwitchesOnMouseUpNotMouseDown() {
+        let view = VideoView(frame: .zero)
+        var clicks = 0
+        view.onClick = { clicks += 1 }
+        func mouse(_ type: NSEvent.EventType) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        }
+        view.mouseDown(with: mouse(.leftMouseDown))
+        XCTAssertEqual(clicks, 0)
+        view.mouseUp(with: mouse(.leftMouseUp))
+        XCTAssertEqual(clicks, 1)
     }
 }

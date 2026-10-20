@@ -21,18 +21,20 @@ final class VideoView: NSView {
         addSubview(label)
     }
 
-    /// Called on every mouseDown, including the click that activates the window.
+    /// Called on every mouseUp, including that of the click that activates the window. Not on
+    /// mouseDown: Deskflow keeps input on the Mac while a button is held, so the edge crossing
+    /// switchSynergy posts would be ignored.
     var onClick: (() -> Void)?
 
-    override func mouseDown(with event: NSEvent) {
+    override func mouseUp(with event: NSEvent) {
         onClick?()
-        super.mouseDown(with: event)
+        super.mouseUp(with: event)
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     /// The window takes no input (Synergy carries it to the Amiga), but keys still arrive here:
-    /// typing while the window is key, and the switch hotkey switchSynergy posts on a click.
+    /// typing while the window is key.
     /// Unhandled, they reach NSResponder's noResponder and beep, so the view takes them and drops them.
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with event: NSEvent) {}
