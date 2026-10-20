@@ -181,3 +181,33 @@ in /sys/module/stk1160/parameters). Measured over 5 s windows (no restart betwee
 corrected; the 1-2 per 5 s left unfixed (2+ holes or shortfall out of range) still yield a short
 frame (short_frames rose 1 -> 6 over ~35 s). Not done: the usbmon field-total check (corrected fields
 ending at 414720 is inferred from short_frames = 0 in clean windows). Open: the unfixed cases.
+
+## Slot 42 loss: packet split at the 128 KiB TRB boundary (fixed 2026-10-21 ~00:57)
+
+Cause (proven by intervention; the exact VL805 failure mode is inferred): the driver laid out the 64
+packets of 3072 bytes back to back in a 196608-byte URB buffer. xhci splits a TD into TRBs at every
+64 KiB boundary. Packet 42 starts at 42*3072 = 129024, so the 128 KiB boundary falls 2048 bytes in:
+it is the only packet split 2048 + 1024 (packet 21 is split 1024 + 2048 at 64 KiB; 192 KiB is the
+buffer end). When the device sends a 2048-byte packet in that slot, the short transfer ends exactly
+at the end of the first TRB, and the VL805 reports it as -EXDEV. That matches every usbmon fact:
+loss only at index 42, slot 42 received as 3072 or 4 bytes but never as 2048, and its neighbours
+getting 2048 about 51 times in 250 URBs (the same rate as the 51 losses).
+
+Fix: `stk1160_isoc_layout()` in `pi/stk1160/stk1160-video.c` starts any packet that would cross a
+64 KiB boundary at that boundary (21 packets per 64 KiB, buffer 199680 bytes instead of 196608), so
+every packet sits in one TRB. The buffer comes from `usb_alloc_noncoherent` (one naturally aligned
+page block without an IOMMU), so buffer offsets match DMA-address boundaries.
+NUM_PACKETS, the alt setting (3072 = 3x1024 high-bandwidth) and the interval are unchanged; leads 2-4
+(other packet counts, lower alt, xhci debugfs) were not needed.
+
+| 30 s window | lost | corrected | unfixed | parts/5 s | short_frames |
+|---|---|---|---|---|---|
+| before (srcversion 21ACE068F5BBA68C50E48BC) | 760 | 744 | 8 | 249 | - |
+| after, window 1 (A86F0404134B1F9A2BE7564) | 0 | 0 | 0 | 250 | 0 |
+| after, window 2 | 0 | 0 | 0 | 250 | 0 (3714 frames) |
+
+`status -18` in `journalctl -k` over the 2 min after install: 0. Previous module saved as
+`~/stk1160-build/stk1160.ko.bbf8984`. The field-repair code stays as a fallback for other losses.
+The owner's screenshot `CleanShot 2026-10-21 at 00.52.14@2x.png` (taken before this fix) shows a 2-3
+line band of displaced fragments near the bottom, consistent with a repaired-field hole; open: the owner's
+eye check that it is gone.

@@ -14,6 +14,8 @@
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/ratelimit.h>
+#include <linux/sizes.h>
+#include <linux/math.h>
 
 #include "stk1160.h"
 #include "stk1160-fieldfix.h"
@@ -487,12 +489,41 @@ free_urb:
 	return 0;
 }
 /*
+ * Lay out the isoc packets of one URB so that no packet straddles a 64 KiB
+ * boundary of the transfer buffer.  xhci splits a TD at every 64 KiB boundary
+ * into two TRBs.  With 3072-byte packets back to back, packet 42 starts at
+ * 129024 and is split 2048 + 1024 at 128 KiB; when the device sends a 2048-byte
+ * packet there (short transfer ending exactly at the TRB end), the Pi 4's VL805
+ * reports it as -EXDEV and the data is lost, about 25 times a second.  Starting
+ * each packet that would cross a boundary at the boundary keeps every packet
+ * in one TRB.  The buffer comes from the page allocator in one naturally
+ * aligned block, so buffer offsets match the DMA address boundaries.
+ * Returns the buffer size needed; fills the descriptors when urb is non-NULL.
+ */
+static int stk1160_isoc_layout(struct urb *urb, int max_packets, int pkt_size)
+{
+	const int seg = SZ_64K;
+	int j, k = 0;
+
+	for (j = 0; j < max_packets; j++) {
+		if (pkt_size <= seg && (k % seg) + pkt_size > seg)
+			k = round_up(k, seg);
+		if (urb) {
+			urb->iso_frame_desc[j].offset = k;
+			urb->iso_frame_desc[j].length = pkt_size;
+		}
+		k += pkt_size;
+	}
+	return k;
+}
+
+/*
  * Allocate URBs
  */
 int stk1160_alloc_isoc(struct stk1160 *dev)
 {
 	struct urb *urb;
-	int i, j, k, sb_size, max_packets, num_bufs;
+	int i, sb_size, max_packets, num_bufs;
 	int ret;
 
 	/*
@@ -507,7 +538,7 @@ int stk1160_alloc_isoc(struct stk1160 *dev)
 
 	num_bufs = STK1160_NUM_BUFS;
 	max_packets = STK1160_NUM_PACKETS;
-	sb_size = max_packets * dev->max_pkt_size;
+	sb_size = stk1160_isoc_layout(NULL, max_packets, dev->max_pkt_size);
 
 	dev->isoc_ctl.buf = NULL;
 	dev->isoc_ctl.max_pkt_size = dev->max_pkt_size;
@@ -546,13 +577,8 @@ int stk1160_alloc_isoc(struct stk1160 *dev)
 		urb->transfer_dma = dev->isoc_ctl.urb_ctl[i].dma;
 		urb->sgt = dev->isoc_ctl.urb_ctl[i].sgt;
 
-		k = 0;
-		for (j = 0; j < max_packets; j++) {
-			urb->iso_frame_desc[j].offset = k;
-			urb->iso_frame_desc[j].length =
-					dev->isoc_ctl.max_pkt_size;
-			k += dev->isoc_ctl.max_pkt_size;
-		}
+		stk1160_isoc_layout(urb, max_packets,
+				    dev->isoc_ctl.max_pkt_size);
 	}
 
 	stk1160_dbg("%d urbs allocated\n", num_bufs);
