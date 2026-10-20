@@ -21,6 +21,7 @@ public final class StreamClient: NSObject, URLSessionDataDelegate {
     private var pollTimer: Timer?
     private var retryWork: DispatchWorkItem?
     private let queue = OperationQueue()
+    private let newest = LatestSlot<CGImage>()
 
     public init(settings: Settings) {
         self.settings = settings
@@ -61,8 +62,12 @@ public final class StreamClient: NSObject, URLSessionDataDelegate {
 
     private func deliver(_ data: Data, fromStream: Bool) {
         guard let image = FrameDecoder.decode(data) else { return }
+        // One main-queue hop at a time: a frame that arrives while the previous one still waits
+        // for the main thread replaces it, so a busy main thread never builds a queue of old
+        // frames to show late, one by one.
+        guard newest.put(image) else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.running else { return }
+            guard let self, let image = self.newest.take(), self.running else { return }
             if fromStream {
                 if !self.gotStreamFrame { self.gotStreamFrame = true; self.failures = 0; self.stopPolling() }
             }
@@ -139,5 +144,28 @@ public final class StreamClient: NSObject, URLSessionDataDelegate {
             guard let self, let data, (response as? HTTPURLResponse)?.statusCode == 200 else { return }
             self.deliver(data, fromStream: false)
         }.resume()
+    }
+}
+
+/// A one-item mailbox between a producer queue and the main queue: put keeps only the newest
+/// item and returns true when the consumer must be woken (the slot was empty); take empties it.
+public final class LatestSlot<T> {
+    private let lock = NSLock()
+    private var item: T?
+
+    public init() {}
+
+    public func put(_ value: T) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let wake = item == nil
+        item = value
+        return wake
+    }
+
+    public func take() -> T? {
+        lock.lock(); defer { lock.unlock() }
+        let value = item
+        item = nil
+        return value
     }
 }

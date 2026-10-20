@@ -96,4 +96,14 @@ final class StreamClientTests: XCTestCase {
         XCTAssertNotNil(FrameDecoder.decode(Self.jpeg(gray: 10)))
         XCTAssertNil(FrameDecoder.decode(Data([1, 2, 3])))
     }
+
+    func testLatestSlotKeepsOnlyTheNewestAndWakesOncePerDrain() {
+        let slot = LatestSlot<Int>()
+        XCTAssertTrue(slot.put(1), "an empty slot must wake the consumer")
+        XCTAssertFalse(slot.put(2), "a waiting wake-up must not be scheduled twice")
+        XCTAssertFalse(slot.put(3))
+        XCTAssertEqual(slot.take(), 3, "the consumer gets the newest frame, not the first")
+        XCTAssertNil(slot.take())
+        XCTAssertTrue(slot.put(4), "after a drain the next frame wakes the consumer again")
+    }
 }
