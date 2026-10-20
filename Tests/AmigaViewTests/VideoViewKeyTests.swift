@@ -18,13 +18,13 @@ final class VideoViewKeyTests: XCTestCase {
     }
 
     /// A key passed up the chain ends at noResponder, which beeps (typing, and the
-    /// Control+Option+Command+F12 a click posts for Synergy).
+    /// Control+Option+F12 a click posts for Synergy).
     func testKeysStopAtTheVideoView() {
         let view = VideoView(frame: .zero)
         let spy = ChainSpy()
         view.nextResponder = spy
         XCTAssertTrue(view.acceptsFirstResponder)
-        view.keyDown(with: key(.keyDown, flags: [.control, .option, .command]))
+        view.keyDown(with: key(.keyDown, flags: [.control, .option]))
         view.keyUp(with: key(.keyUp))
         XCTAssertEqual(spy.passed, [])
     }

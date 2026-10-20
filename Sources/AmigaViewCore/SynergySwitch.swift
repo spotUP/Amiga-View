@@ -1,10 +1,13 @@
 import CoreGraphics
 import Foundation
 
-/// The global hotkey Deskflow binds to switchToScreen(replay): Control+Option+Command+F12.
+/// The global hotkey Deskflow binds to switchToScreen(replay): Control+Option+F12.
+/// Recorded in the Deskflow app as Control+Option+Command+F12, it is saved as
+/// Meta+Alt+Control+F12, and deskflow-core on macOS registers that as Control+Option+F12
+/// (Meta has no Mac key); posting Command as well would keep the hotkey from matching.
 public enum SynergySwitch {
     public static let keyCode: CGKeyCode = 0x6F // kVK_F12
-    public static let flags: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand]
+    public static let flags: CGEventFlags = [.maskControl, .maskAlternate]
     public static let debounce: TimeInterval = 0.5
     public static let defaultsKey = "switchSynergyOnClick"
     public static let untrustedStatus = "Grant Accessibility to switch Synergy on click"

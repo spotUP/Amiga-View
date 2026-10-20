@@ -2,9 +2,12 @@ import XCTest
 @testable import AmigaViewCore
 
 final class SynergySwitchTests: XCTestCase {
-    func testHotkeyIsControlOptionCommandF12() {
+    /// The Deskflow app on macOS records Command as "Control" and Control as "Meta", and
+    /// deskflow-core has no Mac key for Meta, so the hotkey it actually registers is
+    /// Control+Option+F12; a posted Command would keep it from matching.
+    func testHotkeyIsControlOptionF12() {
         XCTAssertEqual(SynergySwitch.keyCode, 0x6F)
-        XCTAssertEqual(SynergySwitch.flags, [.maskControl, .maskAlternate, .maskCommand])
+        XCTAssertEqual(SynergySwitch.flags, [.maskControl, .maskAlternate])
     }
 
     func testEnabledByDefaultAndStored() {

@@ -39,8 +39,6 @@ Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Syn
 
 ### Switch Synergy on Click
 
-Clicking in the video window (also the click that activates it) posts Control+Option+Command+F12, so Deskflow moves keyboard and mouse to the Amiga. In the Deskflow config, section: options:
-
-    keystroke(Control+Alt+Super+F12) = switchToScreen(replay)
+Clicking in the video window (also the click that activates it) posts Control+Option+F12, so Deskflow moves keyboard and mouse to the Amiga. Set the hotkey up in the Deskflow app: Configure Server, Hotkeys, New, press Control+Option+Command+F12, then add the action "Switch to screen" replay. The app saves it as `keystroke(Meta+Alt+Control+F12) = switchToScreen(replay)` (on macOS it names Command "Control" and Control "Meta"), and deskflow-core, which has no Mac key for Meta, registers it as Control+Option+F12. The Deskflow app rewrites `~/Library/Deskflow/deskflow-server.conf` from its own settings whenever the server starts, so edits to that file do not last.
 
 Grant Accessibility to Amiga-View (System Settings, Privacy and Security, Accessibility); without it the status line shows "Grant Accessibility to switch Synergy on click" and nothing is posted. At most one switch per 500 ms. Turn it off in View, "Switch Synergy on Click" (stored as `switchSynergyOnClick`, default on). To return, move the mouse off the Amiga's left edge.
