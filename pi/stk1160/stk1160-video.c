@@ -217,6 +217,29 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 /*
  * Controls the isoc copy of each urb packet
  */
+/*
+ * A packet was lost inside a field (isoc error status). Keep the hole where
+ * it belongs by advancing the position by the payload the packet would have
+ * carried, so the rest of the field is not shifted up by one packet.
+ * The pixels of the hole keep what the buffer held before.
+ */
+static void stk1160_skip_video(struct stk1160 *dev, int len)
+{
+	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
+
+	/* A field is half of the buffer */
+	if (buf->pos >= buf->length / 2)
+		return;
+	len = min_t(unsigned int, len, buf->length / 2 - buf->pos);
+
+	buf->pos += len;
+	buf->bytesused += len;
+
+	dev->isoc_ctl.lost_pkts++;
+	dev_dbg_ratelimited(dev->dev, "lost packet kept as a hole, %u so far\n",
+			    dev->isoc_ctl.lost_pkts);
+}
+
 static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 {
 	int i, len, status;
@@ -237,6 +260,8 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 		status = urb->iso_frame_desc[i].status;
 		if (status < 0) {
 			print_err_status(dev, i, status);
+			if (dev->isoc_ctl.buf && dev->isoc_ctl.last_payload > 0)
+				stk1160_skip_video(dev, dev->isoc_ctl.last_payload);
 			continue;
 		}
 
@@ -287,6 +312,7 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 			continue;
 		}
 
+		dev->isoc_ctl.last_payload = len - 4;
 		stk1160_copy_video(dev, p, len);
 	}
 }

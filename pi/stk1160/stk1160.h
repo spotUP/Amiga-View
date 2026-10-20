@@ -103,6 +103,10 @@ struct stk1160_isoc_ctl {
 
 	/* current buffer */
 	struct stk1160_buffer *buf;
+
+	/* video payload of the last good packet, and packets lost in a field */
+	int last_payload;
+	unsigned int lost_pkts;
 };
 
 struct stk1160_fmt {
