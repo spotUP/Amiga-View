@@ -98,3 +98,16 @@ Revert: `sudo rm /lib/modules/$(uname -r)/updates/stk1160.ko && sudo depmod -a`,
 After a kernel update (apt): the new kernel has its own modules dir, so the patched module is
 not used; fetch the matching tag's driver files into `pi/stk1160/`, re-apply the patch, then
 repeat the command above (headers package must match: `sudo apt install linux-headers-$(uname -r)`).
+
+## After the patched module (installed 2026-10-21 00:08, measured 00:29)
+
+| Measure | Value |
+|---|---|
+| Loaded module | srcversion DF9F29A103C21784221566B = /lib/modules/6.18.50+rpt-rpi-v8/updates/stk1160.ko (stock F3D8524B8BA1A037A15BF78) |
+| Pi localhost curl 5 s | 250 parts = 50/s |
+| short buffers (`/health` short_frames delta) | 0 of 254 in the 5 s window (was 78%); total stuck at 132 since load |
+| dmesg `status -18` | still present (USB loss is unchanged; the patch keeps the hole in place instead of shifting the field) |
+| `out of bounds offset` / `offset out of bounds` | at the ratelimit cap (120/min) both before (stock, 23:38-23:40) and after; not caused by the patch |
+
+Note: `dmesg | grep -c` over a 5 s window reads 0 because the ring buffer is full; count from `journalctl -k` per minute instead.
+Open: the owner's eye check that the tear band is gone.
