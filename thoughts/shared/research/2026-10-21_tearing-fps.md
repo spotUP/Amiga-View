@@ -111,3 +111,45 @@ repeat the command above (headers package must match: `sudo apt install linux-he
 
 Note: `dmesg | grep -c` over a 5 s window reads 0 because the ring buffer is full; count from `journalctl -k` per minute instead.
 Open: the owner's eye check that the tear band is gone.
+
+## Offset frames after the patch: the skip overshoots by 1024 bytes (measured 2026-10-21 ~00:50)
+
+Owner: "same tear band", "some frames shifted down and right" (screenshot
+`~/Pictures/claude-inbox/CleanShot 2026-10-21 at 00.44.38@2x.png`). Method: binary usbmon
+(`/dev/usbmon1`, MON_IOCX_GETX from Python, service running, nothing restarted) logging every isoc
+completion of the video endpoint (0x82, 64 packets per URB): per packet status, actual_length and the
+4-byte header. 250 URBs (2 s), then 1125 URBs. usbmon unloaded afterwards.
+
+| Measure | Value |
+|---|---|
+| Packet sizes (actual_length) | 3072 (11378), 2048 (3242), 4 (1091), 8 (100), odd tails (588, 1612, ...) |
+| Lost packets (status -18) | 51 of 250 URBs, always index 42 |
+| Index 42 when received | 3072 x179, 4 x15, never 2048 (indices 40/41/43/44 get 2048 ~51 times each) |
+| Payload per field without a loss | 414720 = 720*2*288 in 49 of 49 |
+| Shortfall of a field with one loss | exactly 2044 in 50 of 51 (one field short by 31260, not explained) |
+| `last_payload` at each loss | 3068 in every sampled case (the packet before is a 3072 one) |
+| Losses at a field marker / in blanking | 0 of 51 (all mid-field, pos 12272..406980) |
+
+So the lost packet is always one of the device's 2048-byte packets (2044 payload), while the patch
+skips by the previous packet's payload, 3068. The rest of the field lands 1024 bytes late = 512
+pixels right (pixels past x=208 wrap to the next field line = 2 frame lines down). The screenshot
+agrees: below the tear row the text sits ~871 screenshot px right of the same text above it
+(1232 px wide for 720 = 1.71x, so ~509 capture px, i.e. 512). Before the patch the field moved
+2044 bytes early (up/left); now it moves 1024 bytes late (down/right). Hypotheses 2-4 (marker lost,
+camserver pairing, whole-frame shift) ruled out: every loss is mid-field and the field marker
+packets all arrive.
+
+Header byte 1 (low 6 bits) is a per-packet sequence counter (..., 0x29, lost, 0x2b, ...), so a
+loss is visible in the stream, but the lost packet's size is not: the device mixes 3072 and 2048
+packets (3-4 of 3072 between each 2048) to hit the field rate.
+
+Fix (proposed, not built): `pi/stk1160/stk1160-video.c`. Do not guess the size at loss time.
+On an errored packet record `hole_pos = buf->pos` and `holes++` (no advance). At field end (the
+next 0x80/0xc0 marker, before `pos = 0` / `stk1160_buffer_done`), compute
+`deficit = width*2*(height/2) - buf->pos`; if `holes == 1 && 0 < deficit <= 3068`, move the field
+bytes `[hole_pos, pos)` later by `deficit` in field-linear coordinates (line by line from the end,
+since field lines interleave in the buffer: offset(p) = (p / bpl)*2*bpl + (odd ? 0 : bpl) + p % bpl),
+and add `deficit` to `bytesused`. Exact for any lost size; at most one field memmove (<415 KB) per
+loss, ~10/s. More than one loss in a field or a bigger deficit: leave as is (rare). The cheaper
+"skip 2044" variant matches today's measurements only by coincidence of the device's packet mix.
+Upstream cause (VL805 xHCI misses the 2048-byte packet in slot 42) still not investigated.
