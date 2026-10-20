@@ -105,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window.title = "Amiga-View"
         window.contentView = video
+        window.initialFirstResponder = video
         window.contentAspectRatio = ViewGeometry.actualSize
         window.contentMinSize = ViewGeometry.size(scale: 0.5)
         window.isReleasedWhenClosed = false

@@ -11,5 +11,7 @@ let package = Package(
                           swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "AmigaViewCoreTests", dependencies: ["AmigaViewCore"],
                     swiftSettings: [.swiftLanguageMode(.v5)]),
+        .testTarget(name: "AmigaViewTests", dependencies: ["AmigaView"],
+                    swiftSettings: [.swiftLanguageMode(.v5)]),
     ]
 )

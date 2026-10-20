@@ -31,6 +31,14 @@ final class VideoView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// The window takes no input (Synergy carries it to the Amiga), but keys still arrive here:
+    /// typing while the window is key, and the switch hotkey switchSynergy posts on a click.
+    /// Unhandled, they reach NSResponder's noResponder and beep, so the view takes them and drops them.
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) {}
+    override func keyUp(with event: NSEvent) {}
+    override func flagsChanged(with event: NSEvent) {}
+
     required init?(coder: NSCoder) { fatalError("not used") }
 
     var image: CGImage? {
