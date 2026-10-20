@@ -10,7 +10,20 @@ final class TestMJPEGServer {
     private let listenFD: Int32
     private var stopped = false
 
-    init(jpegs: [Data]) {
+    convenience init(jpegs: [Data]) {
+        self.init { send in
+            send(Data("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n".utf8))
+            for _ in 0..<100 {
+                for j in jpegs {
+                    send(Data("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(j.count)\r\n\r\n".utf8) + j + Data("\r\n".utf8))
+                    Thread.sleep(forTimeInterval: 0.02)
+                }
+            }
+        }
+    }
+
+    /// `body` writes the whole response, status line included, then the connection closes.
+    init(body: @escaping (_ send: (Data) -> Void) -> Void) {
         signal(SIGPIPE, SIG_IGN)
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         var one: Int32 = 1
@@ -30,23 +43,17 @@ final class TestMJPEGServer {
             while let self, !self.stopped {
                 let c = accept(fd, nil, nil)
                 if c < 0 { break }
-                self.serve(c, jpegs)
+                self.serve(c, body)
             }
         }
     }
 
-    private func serve(_ c: Int32, _ jpegs: [Data]) {
+    private func serve(_ c: Int32, _ body: (_ send: (Data) -> Void) -> Void) {
         defer { close(c) }
         var req = [UInt8](repeating: 0, count: 4096)
         _ = read(c, &req, req.count)
         func send(_ d: Data) { d.withUnsafeBytes { _ = write(c, $0.baseAddress, d.count) } }
-        send(Data("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n".utf8))
-        for _ in 0..<100 {
-            for j in jpegs {
-                send(Data("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(j.count)\r\n\r\n".utf8) + j + Data("\r\n".utf8))
-                Thread.sleep(forTimeInterval: 0.02)
-            }
-        }
+        body(send)
     }
 
     func stop() { stopped = true; close(listenFD) }

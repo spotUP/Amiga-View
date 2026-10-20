@@ -8,6 +8,7 @@ A Raspberry Pi 4 grabber runs `camserver.py` (from Up_Rough_Demo_System, `tools/
 
 - `GET /stream.mjpg` multipart MJPEG, about 50 fields per second, each 720x288.
 - `GET /snapshot.png` newest frame.
+- `GET /audio.pcm` live sound from the grabber's audio input: raw s16le, 48000 Hz, stereo (camserver `--audio-device`).
 
 On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
 `ssh -N -L 8090:localhost:8090 amigrabber` (key login, BatchMode; `amigrabber` is the Host entry in ~/.ssh/config that names the key ~/.ssh/amigrabber_ed25519) and stops it again on quit. It then reads the MJPEG stream, keeps only the newest frame, and draws it scaled 2x vertically (720x576) with nearest-neighbour scaling. When the stream drops it reconnects with backoff (0.5 s doubling to 8 s) and polls `/snapshot.png` once per second meanwhile. The status line at the bottom left shows "Connecting", "Tunnel failed: reason", "No signal", or the measured FPS.
@@ -18,6 +19,16 @@ On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
     swift test             # unit tests and end-to-end stream test (local test server, no Pi needed)
     scripts/bundle.sh      # release build into build/Amiga-View.app
     open build/Amiga-View.app
+
+## Sound
+
+Amiga-View plays `/audio.pcm` on the default output. It keeps about 60 ms buffered so the sound stays with the picture: after a gap it waits until 60 ms are buffered again, and a backlog over 150 ms is dropped. When camserver serves no audio, it retries quietly with the same backoff as the video.
+
+## Measuring
+
+    "$(swift build --show-bin-path)/Amiga-View" --stats
+
+prints every 5 s to stderr: frames drawn per second, audio bytes received, audio buffered (ms), underruns, dropped frames. UserDefaults keys can be given for one run as arguments, e.g. `-host 127.0.0.1 -port 8097 -via ""`.
 
 ## Settings
 

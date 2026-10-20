@@ -22,6 +22,7 @@ public struct Settings: Equatable {
 
     public var streamURL: URL { URL(string: "http://\(host):\(port)/stream.mjpg")! }
     public var snapshotURL: URL { URL(string: "http://\(host):\(port)/snapshot.png")! }
+    public var audioURL: URL { URL(string: "http://\(host):\(port)/audio.pcm")! }
     /// A tunnel only makes sense when the stream host is this machine.
     public var isLocalHost: Bool { host == "localhost" || host == "127.0.0.1" }
 }

@@ -8,6 +8,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tunnel = TunnelManager()
     private let settings = Settings.load()
     private var client: StreamClient?
+    private var audio: AudioStreamClient?
+    private var player: AudioPlayer?
     private var fpsMeter = FPSMeter()
     private var lastFrame: Date?
     private var baseStatus = "Connecting"
@@ -16,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var synergyItem: NSMenuItem!
     private var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
+    /// `--stats`: print frames decoded and drawn every 5 s to stderr, to measure the rate the app shows.
+    private let printStats = CommandLine.arguments.contains("--stats")
+    private var statsDrawn = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
@@ -27,12 +32,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refreshStatus() }
         startStreaming()
+        if printStats {
+            var last = (drawn: 0, at: Date())
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                let now = Date(), secs = now.timeIntervalSince(last.at)
+                let b = self.audio?.buffer
+                FileHandle.standardError.write(String(format: "stats drawn=%.1f/s total=%d audio_bytes=%d buffered_ms=%.0f underruns=%d dropped=%d\n",
+                    Double(self.statsDrawn - last.drawn) / secs, self.statsDrawn, self.audio?.bytesReceived ?? 0,
+                    Double(b?.bufferedFrames ?? 0) / AudioStreamClient.sampleRate * 1000,
+                    b?.underruns ?? 0, b?.droppedFrames ?? 0).data(using: .utf8)!)
+                last = (self.statsDrawn, now)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         client?.stop()
+        audio?.stop()
+        player?.stop()
         tunnel.stop()
     }
 
@@ -50,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 c.onFrame = { [weak self] image in
                     guard let self else { return }
                     self.video.image = image
+                    self.statsDrawn += 1
                     self.lastFrame = Date()
                     self.fpsMeter.tick(at: Date.timeIntervalSinceReferenceDate)
                 }
@@ -59,6 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.client = c
                 c.start()
+                let a = AudioStreamClient(settings: s)
+                let p = AudioPlayer(buffer: a.buffer)
+                do { try p.start() } catch { NSLog("Amiga-View: audio output failed: \(error)") }
+                self.audio = a; self.player = p
+                a.start()
             }
         }
     }
