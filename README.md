@@ -10,7 +10,7 @@ A Raspberry Pi 4 grabber runs `camserver.py` (from Up_Rough_Demo_System, `tools/
 - `GET /snapshot.png` newest frame.
 
 On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
-`ssh -N -L 8090:localhost:8090 spot@amigrabber.local` (key login, BatchMode) and stops it again on quit. It then reads the MJPEG stream, keeps only the newest frame, and draws it scaled 2x vertically (720x576) with nearest-neighbour scaling. When the stream drops it reconnects with backoff (0.5 s doubling to 8 s) and polls `/snapshot.png` once per second meanwhile. The status line at the bottom left shows "Connecting", "Tunnel failed: reason", "No signal", or the measured FPS.
+`ssh -N -L 8090:localhost:8090 amigrabber` (key login, BatchMode; `amigrabber` is the Host entry in ~/.ssh/config that names the key ~/.ssh/amigrabber_ed25519) and stops it again on quit. It then reads the MJPEG stream, keeps only the newest frame, and draws it scaled 2x vertically (720x576) with nearest-neighbour scaling. When the stream drops it reconnects with backoff (0.5 s doubling to 8 s) and polls `/snapshot.png` once per second meanwhile. The status line at the bottom left shows "Connecting", "Tunnel failed: reason", "No signal", or the measured FPS.
 
 ## Build and run
 
@@ -25,7 +25,7 @@ Stored in UserDefaults for `com.spotup.amiga-view`; change with `defaults write`
 
     defaults write com.spotup.amiga-view host localhost
     defaults write com.spotup.amiga-view port -int 8090
-    defaults write com.spotup.amiga-view via spot@amigrabber.local
+    defaults write com.spotup.amiga-view via amigrabber
 
 The tunnel is only started when `host` is `localhost` or `127.0.0.1` and `via` is not empty. Window position and size are remembered; "Always on Top" is remembered too.
 

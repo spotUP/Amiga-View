@@ -6,7 +6,7 @@ public struct Settings: Equatable {
     public var port: Int
     public var via: String
 
-    public static let defaults = Settings(host: "localhost", port: 8090, via: "spot@amigrabber.local")
+    public static let defaults = Settings(host: "localhost", port: 8090, via: "amigrabber")
 
     public init(host: String, port: Int, via: String) {
         self.host = host; self.port = port; self.via = via

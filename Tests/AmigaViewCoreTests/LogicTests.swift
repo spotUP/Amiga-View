@@ -32,7 +32,7 @@ final class LogicTests: XCTestCase {
     func testSSHArguments() {
         let a = TunnelPlanner.sshArguments(.defaults)
         XCTAssertTrue(a.contains("8090:localhost:8090"))
-        XCTAssertEqual(a.last, "spot@amigrabber.local")
+        XCTAssertEqual(a.last, "amigrabber")
         XCTAssertTrue(a.contains("BatchMode=yes"))
     }
 
