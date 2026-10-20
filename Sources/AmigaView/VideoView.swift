@@ -21,6 +21,16 @@ final class VideoView: NSView {
         addSubview(label)
     }
 
+    /// Called on every mouseDown, including the click that activates the window.
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+        super.mouseDown(with: event)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     required init?(coder: NSCoder) { fatalError("not used") }
 
     var image: CGImage? {

@@ -31,8 +31,16 @@ The tunnel is only started when `host` is `localhost` or `127.0.0.1` and `via` i
 
 ## Menu
 
-View: Actual Size (720x576), Double Size (1440x1152), Always on Top. The window keeps its 5:4 aspect ratio when resized.
+View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Switch Synergy on Click. The window keeps its 5:4 aspect ratio when resized.
 
 ## With Deskflow
 
 Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Synergy client on the A1200 receives input there. Place the Amiga-View window against the right edge of the Mac screen, so the pointer crosses the edge into "replay" right next to the picture of the Amiga. Turn on "Always on Top" to keep the picture visible while you work.
+
+### Switch Synergy on Click
+
+Clicking in the video window (also the click that activates it) posts Control+Option+Command+F12, so Deskflow moves keyboard and mouse to the Amiga. In the Deskflow config, section: options:
+
+    keystroke(Control+Alt+Super+F12) = switchToScreen(replay)
+
+Grant Accessibility to Amiga-View (System Settings, Privacy and Security, Accessibility); without it the status line shows "Grant Accessibility to switch Synergy on click" and nothing is posted. At most one switch per 500 ms. Turn it off in View, "Switch Synergy on Click" (stored as `switchSynergyOnClick`, default on). To return, move the mouse off the Amiga's left edge.
