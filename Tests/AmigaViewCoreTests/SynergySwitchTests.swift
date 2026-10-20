@@ -7,14 +7,14 @@ final class SynergySwitchTests: XCTestCase {
     func testEdgePathCrossesTheRightEdge() {
         let desktop = CGRect(x: 0, y: 0, width: 1800, height: 1169)
         let path = SynergySwitch.edgePath(from: CGPoint(x: 1022, y: 390), desktop: desktop)
-        XCTAssertEqual(path.map(\.x), [1780, 1785, 1790, 1795, 1800, 1805])
+        XCTAssertEqual(path.map(\.x), [1780, 1785, 1790, 1795, 1800])
         XCTAssertEqual(Set(path.map(\.y)), [390])
     }
 
     func testEdgePathKeepsTheHeightOnTheDesktop() {
         let desktop = CGRect(x: -1440, y: 0, width: 3240, height: 1169)
         let path = SynergySwitch.edgePath(from: CGPoint(x: 10, y: 1500), desktop: desktop)
-        XCTAssertEqual(path.last?.x, 1805)
+        XCTAssertEqual(path.last?.x, 1800)
         XCTAssertEqual(Set(path.map(\.y)), [1168])
     }
 

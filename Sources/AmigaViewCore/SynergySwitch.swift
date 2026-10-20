@@ -22,10 +22,12 @@ public enum SynergySwitch {
     }
 
     /// The pointer positions to post: from just inside the right edge of `desktop` (the union of
-    /// the displays, in CoreGraphics coordinates) to just past it, at the pointer's height.
+    /// the displays, in CoreGraphics coordinates) up to the edge, at the pointer's height. The
+    /// last point is the crossing; a move posted after it reaches the Amiga as a jump and can
+    /// carry the pointer back off its left edge.
     public static func edgePath(from pointer: CGPoint, desktop: CGRect) -> [CGPoint] {
         let y = min(max(pointer.y, desktop.minY), desktop.maxY - 1)
-        return stride(from: desktop.maxX - edgeApproach, through: desktop.maxX + edgeStep, by: edgeStep)
+        return stride(from: desktop.maxX - edgeApproach, through: desktop.maxX, by: edgeStep)
             .map { CGPoint(x: $0, y: y) }
     }
 
