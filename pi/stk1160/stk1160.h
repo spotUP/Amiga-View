@@ -150,6 +150,8 @@ struct stk1160 {
 	/* frame properties */
 	int width;		  /* current frame width */
 	int height;		  /* current frame height */
+	/* V4L2_FIELD_INTERLACED: a buffer per frame; ALTERNATE: a buffer per field */
+	enum v4l2_field field;
 	unsigned int ctl_input;	  /* selected input */
 	v4l2_std_id norm;	  /* current norm */
 	struct stk1160_fmt *fmt;  /* selected format */

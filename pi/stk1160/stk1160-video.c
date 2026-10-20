@@ -102,7 +102,8 @@ static void stk1160_field_end(struct stk1160 *dev)
 	unsigned int shift;
 
 	if (buf->holes == 1) {
-		shift = stk1160_fix_field(buf->mem, bpl, buf->odd, field_size,
+		shift = stk1160_fix_field(buf->mem, bpl, buf->odd,
+					  dev->field == V4L2_FIELD_ALTERNATE, field_size,
 					  buf->hole_pos, buf->pos,
 					  dev->isoc_ctl.max_pkt_size - 4);
 		if (shift) {
@@ -134,7 +135,10 @@ void stk1160_buffer_done(struct stk1160 *dev)
 
 	stk1160_field_end(dev);
 	buf->vb.sequence = dev->sequence++;
-	buf->vb.field = V4L2_FIELD_INTERLACED;
+	if (dev->field == V4L2_FIELD_ALTERNATE)
+		buf->vb.field = buf->odd ? V4L2_FIELD_TOP : V4L2_FIELD_BOTTOM;
+	else
+		buf->vb.field = V4L2_FIELD_INTERLACED;
 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
 
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, buf->bytesused);
@@ -151,6 +155,9 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 	struct stk1160_buffer *buf = dev->isoc_ctl.buf;
 	u8 *dst = buf->mem;
 	int remain;
+	int alt = dev->field == V4L2_FIELD_ALTERNATE;
+	/* Gap between two lines of this field in the buffer */
+	int skip = alt ? 0 : bytesperline;
 
 	/*
 	 * TODO: These stk1160_dbg are very spammy!
@@ -167,7 +174,7 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 
 	remain = len;
 
-	dst += stk1160_field_addr(bytesperline, buf->odd, buf->pos);
+	dst += stk1160_field_addr(bytesperline, buf->odd, alt, buf->pos);
 
 	/* Copy the remaining of current line */
 	lencopy = min(remain, bytesperline - (int)(buf->pos % bytesperline));
@@ -211,7 +218,7 @@ void stk1160_copy_video(struct stk1160 *dev, u8 *src, int len)
 	/* Copy current field line by line, interlacing with the other field */
 	while (remain > 0) {
 
-		dst += lencopy + bytesperline;
+		dst += lencopy + skip;
 		src += lencopy;
 
 		/* Copy one line at a time */
@@ -315,11 +322,15 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 		 * These end of field packets are always 0xc0 or 0x80,
 		 * but not always 8-byte long so we don't check packet length.
 		 */
-		if (p[0] == 0xc0) {
+		if (p[0] == 0xc0 || (p[0] == 0x80 &&
+				     dev->field == V4L2_FIELD_ALTERNATE)) {
 
 			/*
 			 * If first byte is 0xc0 then we received
-			 * second field, and frame has ended.
+			 * second field, and frame has ended. In
+			 * V4L2_FIELD_ALTERNATE every field start (0xc0
+			 * or 0x80) ends the buffer of the field before,
+			 * so a field leaves one field period earlier.
 			 */
 			if (dev->isoc_ctl.buf != NULL)
 				stk1160_buffer_done(dev);
@@ -341,7 +352,7 @@ static void stk1160_process_isoc(struct stk1160 *dev, struct urb *urb)
 			/* We set next packet parity and
 			 * continue to get next one
 			 */
-			if (p[0] == 0x80)
+			if (p[0] == 0x80 && dev->field != V4L2_FIELD_ALTERNATE)
 				stk1160_field_end(dev);
 			dev->isoc_ctl.buf->odd = *p & 0x40;
 			dev->isoc_ctl.buf->pos = 0;

@@ -12,10 +12,16 @@
 #include <string.h>
 #endif
 
-/* Byte offset in the frame buffer of field byte f (odd: first, else second) */
+/*
+ * Byte offset in the buffer of field byte f. Interlaced (alt 0): the field's
+ * lines go to every other line of the frame, odd: the first. Alternate (alt 1,
+ * V4L2_FIELD_ALTERNATE): the buffer holds this one field, lines in a row.
+ */
 static inline unsigned int stk1160_field_addr(unsigned int bpl, int odd,
-					      unsigned int f)
+					      int alt, unsigned int f)
 {
+	if (alt)
+		return f;
 	return (odd ? 0 : bpl) + (f / bpl) * 2 * bpl + f % bpl;
 }
 
@@ -25,7 +31,7 @@ static inline unsigned int stk1160_field_addr(unsigned int bpl, int odd,
  * field_size - pos, last bytes first. Returns the shift, 0 when untouched
  * (shift outside 1..max_shift or hole beyond pos).
  */
-static inline unsigned int stk1160_fix_field(u8 *mem, unsigned int bpl, int odd,
+static inline unsigned int stk1160_fix_field(u8 *mem, unsigned int bpl, int odd, int alt,
 					     unsigned int field_size,
 					     unsigned int hole, unsigned int pos,
 					     unsigned int max_shift)
@@ -49,8 +55,8 @@ static inline unsigned int stk1160_fix_field(u8 *mem, unsigned int bpl, int odd,
 		m = (dst_end - 1) % bpl + 1;
 		if (m < chunk)
 			chunk = m;
-		memmove(mem + stk1160_field_addr(bpl, odd, dst_end - chunk),
-			mem + stk1160_field_addr(bpl, odd, src_end - chunk),
+		memmove(mem + stk1160_field_addr(bpl, odd, alt, dst_end - chunk),
+			mem + stk1160_field_addr(bpl, odd, alt, src_end - chunk),
 			chunk);
 		n -= chunk;
 	}

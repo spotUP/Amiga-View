@@ -349,17 +349,26 @@ static int vidioc_enum_fmt_vid_cap(struct file *file, void  *priv,
 	return 0;
 }
 
+/*
+ * Lines in one buffer: the frame, or one field of it in V4L2_FIELD_ALTERNATE
+ * (where the format's height is the field's, as the V4L2 spec says).
+ */
+static unsigned int stk1160_buf_lines(struct stk1160 *dev)
+{
+	return dev->field == V4L2_FIELD_ALTERNATE ? dev->height / 2 : dev->height;
+}
+
 static int vidioc_g_fmt_vid_cap(struct file *file, void *priv,
 					struct v4l2_format *f)
 {
 	struct stk1160 *dev = video_drvdata(file);
 
 	f->fmt.pix.width = dev->width;
-	f->fmt.pix.height = dev->height;
-	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
+	f->fmt.pix.height = stk1160_buf_lines(dev);
+	f->fmt.pix.field = dev->field;
 	f->fmt.pix.pixelformat = dev->fmt->fourcc;
 	f->fmt.pix.bytesperline = dev->width * 2;
-	f->fmt.pix.sizeimage = dev->height * f->fmt.pix.bytesperline;
+	f->fmt.pix.sizeimage = stk1160_buf_lines(dev) * f->fmt.pix.bytesperline;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
 
 	return 0;
@@ -373,6 +382,8 @@ static int stk1160_try_fmt(struct stk1160 *dev, struct v4l2_format *f,
 	unsigned int col_n, row_n;
 	enum stk1160_decimate_mode col_mode, row_mode;
 	bool col_en, row_en;
+	/* One field per buffer: the height asked for is a field's */
+	bool alt = f->fmt.pix.field == V4L2_FIELD_ALTERNATE;
 
 	base_width = 720;
 	base_height = (dev->norm & V4L2_STD_525_60) ? 480 : 576;
@@ -380,7 +391,7 @@ static int stk1160_try_fmt(struct stk1160 *dev, struct v4l2_format *f,
 	/* Minimum width and height is 5% the frame size */
 	width = clamp_t(unsigned int, f->fmt.pix.width,
 			base_width / 20, base_width);
-	height = clamp_t(unsigned int, f->fmt.pix.height,
+	height = clamp_t(unsigned int, f->fmt.pix.height * (alt ? 2 : 1),
 			base_height / 20, base_height);
 
 	/* Let's set default no decimation values */
@@ -449,7 +460,12 @@ static int stk1160_try_fmt(struct stk1160 *dev, struct v4l2_format *f,
 	}
 
 	f->fmt.pix.pixelformat = dev->fmt->fourcc;
-	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
+	if (alt) {
+		f->fmt.pix.field = V4L2_FIELD_ALTERNATE;
+		f->fmt.pix.height /= 2;
+	} else {
+		f->fmt.pix.field = V4L2_FIELD_INTERLACED;
+	}
 	f->fmt.pix.bytesperline = f->fmt.pix.width * 2;
 	f->fmt.pix.sizeimage = f->fmt.pix.height * f->fmt.pix.bytesperline;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
@@ -491,7 +507,9 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,
 	if (rc < 0)
 		return rc;
 	dev->width = f->fmt.pix.width;
-	dev->height = f->fmt.pix.height;
+	dev->field = f->fmt.pix.field;
+	dev->height = f->fmt.pix.height *
+		(dev->field == V4L2_FIELD_ALTERNATE ? 2 : 1);
 	stk1160_set_fmt(dev, &ctrl);
 
 	return 0;
@@ -654,7 +672,7 @@ static int queue_setup(struct vb2_queue *vq,
 	struct stk1160 *dev = vb2_get_drv_priv(vq);
 	unsigned long size;
 
-	size = dev->width * dev->height * 2;
+	size = dev->width * stk1160_buf_lines(dev) * 2;
 
 	/*
 	 * Here we can change the number of buffers being requested.
@@ -703,7 +721,7 @@ static void buffer_queue(struct vb2_buffer *vb)
 		 * If buffer length is less from expected then we return
 		 * the buffer to userspace directly.
 		 */
-		if (buf->length < dev->width * dev->height * 2)
+		if (buf->length < dev->width * stk1160_buf_lines(dev) * 2)
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 		else
 			list_add_tail(&buf->list, &dev->avail_bufs);
@@ -819,6 +837,7 @@ int stk1160_video_register(struct stk1160 *dev)
 	dev->norm = V4L2_STD_NTSC_M;
 	dev->width = 720;
 	dev->height = 480;
+	dev->field = V4L2_FIELD_INTERLACED;
 
 	/* set default format */
 	dev->fmt = &format[0];
