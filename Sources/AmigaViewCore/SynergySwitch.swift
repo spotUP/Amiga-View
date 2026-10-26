@@ -10,6 +10,10 @@ public enum SynergySwitch {
     public static let edgeStep: CGFloat = 5
     public static let debounce: TimeInterval = 0.5
     public static let defaultsKey = "switchSynergyOnClick"
+    /// Gap kept between the window and the right edge of the desktop. Deskflow brings the pointer
+    /// back from the Amiga a few points inside that edge (x 1790-1798 of 1800 in its log); a window
+    /// there catches it, and the next click sends input straight back to the Amiga.
+    public static let edgeClearance: CGFloat = 16
     public static let untrustedStatus = "Grant Accessibility to switch Synergy on click"
 
     /// On by default; only an explicit false in the store turns it off.
@@ -29,6 +33,14 @@ public enum SynergySwitch {
         let y = min(max(pointer.y, desktop.minY), desktop.maxY - 1)
         return stride(from: desktop.maxX - edgeApproach, through: desktop.maxX, by: edgeStep)
             .map { CGPoint(x: $0, y: y) }
+    }
+
+    /// `frame` moved left as far as needed to end `edgeClearance` short of the right edge of
+    /// `desktop`. Only x changes, so it holds in AppKit and CoreGraphics coordinates alike.
+    public static func clearOfEdge(_ frame: CGRect, desktop: CGRect) -> CGRect {
+        let limit = desktop.maxX - edgeClearance
+        guard frame.maxX > limit else { return frame }
+        return frame.offsetBy(dx: limit - frame.maxX, dy: 0)
     }
 
     /// Whether a click at `now` should switch. `lastSent` is the time of the previous switch.

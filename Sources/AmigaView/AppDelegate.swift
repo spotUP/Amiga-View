@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private let video = VideoView(frame: NSRect(origin: .zero, size: ViewGeometry.actualSize))
     private let tunnel = TunnelManager()
+    private let edgeGuard = EdgeGuard()
     private let settings = Settings.load()
     private var client: StreamClient?
     private var audio: AudioStreamClient?
@@ -154,6 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         if !window.setFrameUsingName("MainWindow") { window.center() }
         window.setFrameAutosaveName("MainWindow")
+        window.delegate = edgeGuard
+        edgeGuard.apply(to: window)
         window.level = UserDefaults.standard.bool(forKey: "alwaysOnTop") ? .floating : .normal
         window.makeKeyAndOrderFront(nil)
     }

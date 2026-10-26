@@ -46,7 +46,7 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Switch Syne
 
 ## With Deskflow
 
-Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Synergy client on the A1200 receives input there. Place the Amiga-View window against the right edge of the Mac screen, so the pointer crosses the edge into "replay" right next to the picture of the Amiga. Turn on "Always on Top" to keep the picture visible while you work.
+Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Synergy client on the A1200 receives input there. Place the Amiga-View window near the right edge of the Mac screen, so the pointer crosses the edge into "replay" close to the picture of the Amiga. The window always stays 16 points clear of that edge: Deskflow brings the pointer back from the Amiga just inside it, and a window there would catch the pointer so the next click sends input straight back to the Amiga. To leave the Amiga, move the pointer off its left edge; Cmd+Q and other Mac shortcuts go to the Amiga while it has the keyboard. Turn on "Always on Top" to keep the picture visible while you work.
 
 ### Switch Synergy on Click
 

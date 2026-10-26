@@ -37,4 +37,20 @@ final class SynergySwitchTests: XCTestCase {
         XCTAssertFalse(SynergySwitch.shouldSend(enabled: true, trusted: true, lastSent: 10, now: 10.4))
         XCTAssertTrue(SynergySwitch.shouldSend(enabled: true, trusted: true, lastSent: 10, now: 10.5))
     }
+
+    /// Deskflow returns the pointer at x 1790-1798 of 1800; the window must end left of that.
+    func testClearOfEdgeMovesAWindowOffTheRightEdge() {
+        let desktop = CGRect(x: 0, y: 0, width: 1800, height: 1169)
+        let over = CGRect(x: 1200, y: 300, width: 720, height: 600)
+        XCTAssertEqual(SynergySwitch.clearOfEdge(over, desktop: desktop), CGRect(x: 1064, y: 300, width: 720, height: 600))
+        let inside = CGRect(x: 100, y: 300, width: 720, height: 600)
+        XCTAssertEqual(SynergySwitch.clearOfEdge(inside, desktop: desktop), inside)
+    }
+
+    /// Only the desktop's right edge counts: a window on a display left of the main one stays put.
+    func testClearOfEdgeUsesTheDesktopEdge() {
+        let desktop = CGRect(x: -1440, y: 0, width: 3240, height: 1169)
+        let left = CGRect(x: -800, y: 0, width: 720, height: 600)
+        XCTAssertEqual(SynergySwitch.clearOfEdge(left, desktop: desktop), left)
+    }
 }
