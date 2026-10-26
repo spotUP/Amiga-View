@@ -50,6 +50,13 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Oversc
 - Enter Full Screen: standard macOS full screen. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
 - Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`, `picture.scanlines`) and survives a restart.
 
+## Snapshot and recording
+
+The File menu saves what the window shows.
+
+- **Save Snapshot** (cmd-S) writes the newest frame as a PNG to the Desktop, named `Amiga-View 2026-10-27 at 14.03.09.png`. It is the displayed picture: every line doubled (720x576), cropped when Crop Overscan is on.
+- **Start Recording** / **Stop Recording** (cmd-R) writes `Amiga-View <date> at <time>.mov` to Movies: H.264 video at the displayed size, plus AAC sound when Sound is on. Picture times follow frame arrival, so a stalled stream shows as a pause; sound is timed by sample count from the first frame. The status line shows `Recording 00:12` and the frame rate. Quitting finishes the file. A frame backlog is dropped rather than slowing the display.
+
 ## With Deskflow
 
 Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Synergy client on the A1200 receives input there. Place the Amiga-View window near the right edge of the Mac screen, so the pointer crosses the edge into "replay" close to the picture of the Amiga. The window always stays 16 points clear of that edge: Deskflow brings the pointer back from the Amiga just inside it, and a window there would catch the pointer so the next click sends input straight back to the Amiga. To leave the Amiga, move the pointer off its left edge; Cmd+Q and other Mac shortcuts go to the Amiga while it has the keyboard. Turn on "Always on Top" to keep the picture visible while you work.

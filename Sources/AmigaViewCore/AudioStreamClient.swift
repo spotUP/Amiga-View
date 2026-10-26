@@ -18,6 +18,13 @@ public final class AudioStreamClient: NSObject, URLSessionDataDelegate {
     public let buffer: PCMJitterBuffer
     public private(set) var bytesReceived = 0
     public var onEvent: ((String) -> Void)?
+    private let tapLock = NSLock()
+    private var tap: ((Data) -> Void)?
+    /// Called with every chunk of PCM as it arrives, on the network queue (the recorder's tap).
+    public var onPCM: ((Data) -> Void)? {
+        get { tapLock.lock(); defer { tapLock.unlock() }; return tap }
+        set { tapLock.lock(); tap = newValue; tapLock.unlock() }
+    }
 
     private let url: URL
     private var session: URLSession!
@@ -72,6 +79,7 @@ public final class AudioStreamClient: NSObject, URLSessionDataDelegate {
         failures = 0
         bytesReceived += data.count
         buffer.write(data)
+        onPCM?(data)
     }
 
     public func urlSession(_ session: URLSession, task t: URLSessionTask, didCompleteWithError error: Error?) {

@@ -78,4 +78,18 @@ public enum ViewGeometry {
     public static func scanlineAlphas(fieldLines: Int) -> [CGFloat] {
         (0..<max(fieldLines, 0) * Int(verticalScale)).map { $0 % 2 == 1 ? scanlineDarkness : 0 }
     }
+
+    /// The picture as displayed: `crop` (field pixels) cut out of the field and every line doubled
+    /// with the nearest filter, so 720x288 becomes 720x576. Used by snapshots and recordings.
+    public static func displayImage(from field: CGImage, crop: CGRect = fullField) -> CGImage? {
+        let r = crop.integral.intersection(CGRect(x: 0, y: 0, width: field.width, height: field.height))
+        guard !r.isNull, r.width > 0, r.height > 0, let part = field.cropping(to: r),
+              let ctx = CGContext(data: nil, width: part.width, height: part.height * Int(verticalScale), bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(part, in: CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height))
+        return ctx.makeImage()
+    }
 }

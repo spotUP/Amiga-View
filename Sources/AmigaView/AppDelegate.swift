@@ -18,6 +18,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastFrame: Date?
     private var baseStatus = "Connecting"
     private var statusTimer: Timer?
+    /// Where snapshots and recordings go; tests point them at a temp directory.
+    var snapshotDirectory = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+    var recordingDirectory = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0]
+    static let flashDuration: TimeInterval = 3
+    private var flash: (text: String, until: TimeInterval)?
+    private(set) var recorder: Recorder?
+    private var recordingStartedAt: TimeInterval = 0
+    private var recordItem: NSMenuItem!
+    /// Runs on the main queue when a stopped recording is finished and playable; replaced by tests.
+    var recordingFinished: ((URL) -> Void)?
     private var alwaysOnTopItem: NSMenuItem!
     private var synergyItem: NSMenuItem!
     private var soundItem: NSMenuItem!
@@ -60,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        recorder?.finishAndWait()
         client?.stop()
         audio?.stop()
         player?.stop()
@@ -77,13 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let failure { self.baseStatus = "Tunnel failed: \(failure)"; self.refreshStatus() }
                 // Still try: the stream may be reachable some other way.
                 let c = StreamClient(settings: s)
-                c.onFrame = { [weak self] image in
-                    guard let self else { return }
-                    self.video.image = image
-                    self.statsDrawn += 1
-                    self.lastFrame = Date()
-                    self.fpsMeter.tick(at: Date.timeIntervalSinceReferenceDate)
-                }
+                c.onFrame = { [weak self] image in self?.handleFrame(image) }
                 c.onEvent = { [weak self] text in
                     guard let self, self.lastFrame == nil, !self.baseStatus.hasPrefix("Tunnel failed") else { return }
                     self.baseStatus = text
@@ -95,12 +100,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func handleFrame(_ image: CGImage) {
+        video.image = image
+        statsDrawn += 1
+        lastFrame = Date()
+        fpsMeter.tick(at: Date.timeIntervalSinceReferenceDate)
+        recorder?.push(frame: image, at: ProcessInfo.processInfo.systemUptime)
+    }
+
     private func startAudio() {
         guard audio == nil else { return }
         let a = AudioStreamClient(settings: settings)
         let p = AudioPlayer(buffer: a.buffer)
         do { try p.start() } catch { NSLog("Amiga-View: audio output failed: \(error)") }
         audio = a; player = p
+        if let recorder { a.onPCM = { recorder.push(pcm: $0) } }
         a.start()
     }
 
@@ -108,6 +122,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audio?.stop()
         player?.stop()
         audio = nil; player = nil
+    }
+
+    // MARK: Snapshot and recording
+
+    /// The crop the picture is shown with.
+    private var currentCrop: CGRect {
+        PictureOption.cropOverscan.isEnabled(in: defaults) ? ViewGeometry.cropRect(in: defaults) : ViewGeometry.fullField
+    }
+
+    private func showFlash(_ text: String) {
+        flash = (text, ProcessInfo.processInfo.systemUptime + Self.flashDuration)
+        refreshStatus()
+    }
+
+    @objc private func saveSnapshot() {
+        guard let field = video.image else { showFlash("No picture to save"); return }
+        guard let image = ViewGeometry.displayImage(from: field, crop: currentCrop), let png = CaptureFile.png(image) else {
+            showFlash("Snapshot failed"); return
+        }
+        let url = CaptureFile.url(in: snapshotDirectory, date: Date(), ext: "png")
+        do { try png.write(to: url); showFlash("Saved \(url.lastPathComponent)") }
+        catch { showFlash("Snapshot failed: \(error.localizedDescription)") }
+    }
+
+    @objc private func toggleRecording() {
+        if let r = recorder { stopRecording(r) } else { startRecording() }
+    }
+
+    private func startRecording() {
+        let url = CaptureFile.url(in: recordingDirectory, date: Date(), ext: "mov")
+        do {
+            let r = try Recorder(url: url, crop: currentCrop, withAudio: audio != nil)
+            recorder = r
+            recordingStartedAt = ProcessInfo.processInfo.systemUptime
+            audio?.onPCM = { r.push(pcm: $0) }
+            recordItem.title = "Stop Recording"
+        } catch { showFlash("Recording failed: \(error.localizedDescription)") }
+    }
+
+    private func stopRecording(_ r: Recorder) {
+        recorder = nil
+        audio?.onPCM = nil
+        recordItem.title = "Start Recording"
+        showFlash("Saving \(r.url.lastPathComponent)")
+        r.finish { [weak self] in
+            DispatchQueue.main.async {
+                self?.showFlash("Saved \(r.url.lastPathComponent)")
+                self?.recordingFinished?(r.url)
+            }
+        }
     }
 
     // MARK: Synergy switch
@@ -138,6 +202,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshStatus() {
         deskflow.poll()
         video.amigaHasInput = deskflow.amigaHasInput
+        if let f = flash {
+            if ProcessInfo.processInfo.systemUptime < f.until { video.status = f.text; return }
+            flash = nil
+        }
         if let text = deskflow.overrideStatus { video.status = text; return }
         if SynergySwitch.isEnabled() && !accessibilityTrusted {
             video.status = SynergySwitch.untrustedStatus
@@ -145,15 +213,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let now = Date.timeIntervalSinceReferenceDate
         let fps = fpsMeter.fps(at: now)
+        let recording = recorder == nil ? "" : "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt)) - "
         if let last = lastFrame, Date().timeIntervalSince(last) < 3 {
             let mode = client?.usingSnapshotFallback == true ? " (snapshot polling)" : ""
-            video.status = String(format: "%.0f FPS%@", fps, mode)
+            video.status = recording + String(format: "%.0f FPS%@", fps, mode)
         } else if lastFrame != nil {
-            video.status = "No signal"
-        } else if baseStatus == "Connecting" || baseStatus == "Stream dropped" {
-            video.status = baseStatus
+            video.status = recording + "No signal"
         } else {
-            video.status = baseStatus
+            video.status = recording + baseStatus
         }
     }
 
@@ -185,6 +252,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Quit Amiga-View", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+
+        let fileItem = NSMenuItem(); main.addItem(fileItem)
+        let file = NSMenu(title: "File")
+        file.addItem(withTitle: "Save Snapshot", action: #selector(saveSnapshot), keyEquivalent: "s").target = self
+        recordItem = file.addItem(withTitle: recorder == nil ? "Start Recording" : "Stop Recording",
+                                  action: #selector(toggleRecording), keyEquivalent: "r")
+        recordItem.target = self
+        fileItem.submenu = file
 
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let view = NSMenu(title: "View")
@@ -223,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Pushes the picture options into the view and the window's aspect ratio. A change of the
     /// crop keeps the window's width and follows the new aspect in height.
     private func applyPicture(resize: Bool = true) {
-        let crop = PictureOption.cropOverscan.isEnabled(in: defaults) ? ViewGeometry.cropRect(in: defaults) : ViewGeometry.fullField
+        let crop = currentCrop
         video.crop = crop
         video.integerScaling = PictureOption.integerScaling.isEnabled(in: defaults)
         video.scanlines = PictureOption.scanlines.isEnabled(in: defaults)
