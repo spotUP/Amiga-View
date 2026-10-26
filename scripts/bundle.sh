@@ -11,6 +11,10 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$(swift build -c release --show-bin-path)/Amiga-View" "$APP/Contents/MacOS/Amiga-View"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+mkdir -p "$APP/Contents/Resources"
+rm -rf build/AppIcon.iconset
+swift scripts/make-icon.swift build/AppIcon.iconset
+iconutil -c icns build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 IDENTITY="${AMIGA_VIEW_IDENTITY:-Amiga-View Dev}"
 if security find-identity -p codesigning | grep -q "\"$IDENTITY\""; then
     codesign --force --sign "$IDENTITY" "$APP"
