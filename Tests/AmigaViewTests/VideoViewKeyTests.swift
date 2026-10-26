@@ -29,6 +29,23 @@ final class VideoViewKeyTests: XCTestCase {
         XCTAssertEqual(spy.passed, [])
     }
 
+    /// Esc is the only key the view acts on; it neither beeps nor reaches the Amiga-bound chain.
+    func testOnlyEscCallsOnEscape() {
+        let view = VideoView(frame: .zero)
+        let spy = ChainSpy()
+        view.nextResponder = spy
+        var escapes = 0
+        view.onEscape = { escapes += 1 }
+        view.keyDown(with: key(.keyDown))
+        XCTAssertEqual(escapes, 0)
+        let esc = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                                   context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}",
+                                   isARepeat: false, keyCode: VideoView.escapeKeyCode)!
+        view.keyDown(with: esc)
+        XCTAssertEqual(escapes, 1)
+        XCTAssertEqual(spy.passed, [])
+    }
+
     /// Deskflow keeps input on the Mac while a button is held, so the switch fires on release.
     func testClickSwitchesOnMouseUpNotMouseDown() {
         let view = VideoView(frame: .zero)

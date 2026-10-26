@@ -34,6 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pictureItems: [PictureOption: NSMenuItem] = [:]
     /// Posts the edge crossing; replaced by tests.
     lazy var performSwitch: () -> Void = { [weak self] in self?.postEdgeCrossing() }
+    /// Full screen state and exit. Injected so tests need no real full-screen transition.
+    lazy var isFullScreen: () -> Bool = { [weak self] in self?.window.styleMask.contains(.fullScreen) ?? false }
+    lazy var exitFullScreen: () -> Void = { [weak self] in self?.window.toggleFullScreen(nil) }
+    static let fullScreenHint = "Press Esc or Control-Command-F to leave full screen"
     var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
     private lazy var deskflow = DeskflowMonitor(path: DeskflowLog.path(), clock: { ProcessInfo.processInfo.systemUptime },
@@ -130,6 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var currentCrop: CGRect {
         PictureOption.cropOverscan.isEnabled(in: defaults) ? ViewGeometry.cropRect(in: defaults) : ViewGeometry.fullField
     }
+
+    /// Full screen hides the title bar and its buttons, so say how to get out.
+    @objc private func didEnterFullScreen() { showFlash(Self.fullScreenHint) }
 
     private func showFlash(_ text: String) {
         flash = (text, ProcessInfo.processInfo.systemUptime + Self.flashDuration)
@@ -242,6 +249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyPicture(resize: false)
         window.delegate = edgeGuard
         edgeGuard.apply(to: window)
+        video.onEscape = { [weak self] in
+            guard let self, self.isFullScreen() else { return }
+            self.exitFullScreen()
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(didEnterFullScreen),
+                                               name: NSWindow.didEnterFullScreenNotification, object: window)
         window.level = defaults.bool(forKey: "alwaysOnTop") ? .floating : .normal
         window.makeKeyAndOrderFront(nil)
     }

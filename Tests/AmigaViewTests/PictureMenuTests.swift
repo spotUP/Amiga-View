@@ -79,6 +79,26 @@ final class PictureMenuTests: XCTestCase {
         XCTAssertEqual(i.keyEquivalentModifierMask, [.control, .command])
     }
 
+    /// Full screen hides the window buttons: entering it says how to leave, and Esc leaves it.
+    func testEscLeavesFullScreenAndEnteringSaysHow() {
+        var fullScreen = false, exits = 0
+        app.isFullScreen = { fullScreen }
+        app.exitFullScreen = { exits += 1 }
+        func esc() -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                             windowNumber: app.window.windowNumber, context: nil, characters: "\u{1b}",
+                             charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: VideoView.escapeKeyCode)!
+        }
+        app.video.keyDown(with: esc())
+        XCTAssertEqual(exits, 0)
+
+        NotificationCenter.default.post(name: NSWindow.didEnterFullScreenNotification, object: app.window)
+        XCTAssertEqual(app.video.status, AppDelegate.fullScreenHint)
+        fullScreen = true
+        app.video.keyDown(with: esc())
+        XCTAssertEqual(exits, 1)
+    }
+
     /// A click near the right edge of the desktop is ignored; a click elsewhere switches.
     func testClickNearTheEdgeDoesNotSwitch() {
         var switches = 0

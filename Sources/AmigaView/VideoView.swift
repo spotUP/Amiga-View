@@ -37,11 +37,18 @@ final class VideoView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    static let escapeKeyCode: UInt16 = 53
+    /// Called for Esc, the one key the view acts on: full screen is left the way video players
+    /// leave it.
+    var onEscape: (() -> Void)?
+
     /// The window takes no input (Synergy carries it to the Amiga), but keys still arrive here:
     /// typing while the window is key.
     /// Unhandled, they reach NSResponder's noResponder and beep, so the view takes them and drops them.
     override var acceptsFirstResponder: Bool { true }
-    override func keyDown(with event: NSEvent) {}
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == Self.escapeKeyCode { onEscape?() }
+    }
     override func keyUp(with event: NSEvent) {}
     override func flagsChanged(with event: NSEvent) {}
 

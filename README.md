@@ -47,7 +47,7 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Oversc
 - Crop Overscan: shows only the area where the Amiga draws, 708x287 field pixels (the grabber's black margins on the right and bottom go away). Override the rectangle with the `cropX`, `cropY`, `cropWidth`, `cropHeight` defaults (field pixels, from the top left).
 - Integer Scaling: draws the picture at the largest whole multiple of its size that fits the window, centred on black; the normal fit when even 1x does not fit.
 - Scanlines: darkens the second display row of every field line by 35 percent.
-- Enter Full Screen: standard macOS full screen. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
+- Enter Full Screen: standard macOS full screen. Press Esc or ctrl-cmd-F to leave it (the status line says so for 3 s on entering); keys only reach the Mac while it has the input. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
 - Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`, `picture.scanlines`) and survives a restart.
 
 ## Snapshot and recording
