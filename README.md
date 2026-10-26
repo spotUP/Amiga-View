@@ -17,7 +17,7 @@ On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
 
     swift build            # debug build
     swift test             # unit tests and end-to-end stream test (local test server, no Pi needed)
-    scripts/bundle.sh      # release build into build/Amiga-View.app
+    scripts/bundle.sh      # release build into build/Amiga-View.app, with the icon drawn by scripts/make-icon.swift
     open build/Amiga-View.app
 
 ## Sound
@@ -53,3 +53,7 @@ Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Syn
 Clicking in the video window (also the click that activates it) moves keyboard and mouse to the Amiga: on release, Amiga-View posts mouse moves that carry the pointer across the right edge of the desktop, the same edge crossing that switches Deskflow by hand. No Deskflow hotkey is needed; Deskflow ignores posted hotkeys, so a switchToScreen keystroke cannot be triggered from the app.
 
 Grant Accessibility to Amiga-View (System Settings, Privacy and Security, Accessibility); without it the status line shows "Grant Accessibility to switch Synergy on click" and the click does nothing. At most one switch per 500 ms. Turn it off in View, "Switch Synergy on Click" (stored as `switchSynergyOnClick`, default on). To return, move the mouse off the Amiga's left edge.
+
+## Licence
+
+MIT (see LICENSE), except `pi/stk1160`, a modified Linux driver under GPL-2.0.
