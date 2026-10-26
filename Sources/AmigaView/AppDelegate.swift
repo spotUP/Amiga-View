@@ -3,10 +3,13 @@ import ApplicationServices
 import AmigaViewCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: NSWindow!
-    private let video = VideoView(frame: NSRect(origin: .zero, size: ViewGeometry.actualSize))
+    private(set) var window: NSWindow!
+    let video = VideoView(frame: NSRect(origin: .zero, size: ViewGeometry.actualSize))
     private let tunnel = TunnelManager()
-    private let edgeGuard = EdgeGuard()
+    let edgeGuard = EdgeGuard()
+    /// Where the window frame is saved; tests set nil so they leave the user's window alone.
+    var frameAutosaveName: String? = "MainWindow"
+    var defaults = UserDefaults.standard
     private let settings = Settings.load()
     private var client: StreamClient?
     private var audio: AudioStreamClient?
@@ -18,7 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var alwaysOnTopItem: NSMenuItem!
     private var synergyItem: NSMenuItem!
     private var soundItem: NSMenuItem!
-    private var accessibilityTrusted = false
+    private var pictureItems: [PictureOption: NSMenuItem] = [:]
+    /// Posts the edge crossing; replaced by tests.
+    lazy var performSwitch: () -> Void = { [weak self] in self?.postEdgeCrossing() }
+    var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
     private lazy var deskflow = DeskflowMonitor(path: DeskflowLog.path(), clock: { ProcessInfo.processInfo.systemUptime },
                                                 trusted: { [weak self] in self?.accessibilityTrusted ?? false })
@@ -31,7 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         accessibilityTrusted = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
-        video.onClick = { [weak self] in self?.switchSynergy() }
+        video.onClick = { [weak self] in self?.switchSynergy(clickAt: $0) }
         NSApp.activate(ignoringOtherApps: true)
         refreshStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refreshStatus() }
@@ -106,12 +112,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Synergy switch
 
-    /// Thin posting layer; the decision lives in SynergySwitch.shouldSend.
-    private func switchSynergy() {
+    /// Thin glue; the decisions live in SynergySwitch.isClickClearOfEdge and shouldSend.
+    func switchSynergy(clickAt location: CGPoint) {
+        guard SynergySwitch.isClickClearOfEdge(at: location, desktop: edgeGuard.desktop()) else { return }
         let now = ProcessInfo.processInfo.systemUptime
         guard SynergySwitch.shouldSend(enabled: SynergySwitch.isEnabled(), trusted: accessibilityTrusted,
                                        lastSent: lastSwitch, now: now) else { return }
         lastSwitch = now
+        performSwitch()
+    }
+
+    private func postEdgeCrossing() {
         guard let pointer = CGEvent(source: nil)?.location else { return }
         var count: UInt32 = 0
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -148,25 +159,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Window and menu
 
-    private func buildWindow() {
+    func buildWindow() {
         window = NSWindow(contentRect: NSRect(origin: .zero, size: ViewGeometry.actualSize),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "Amiga-View"
         window.contentView = video
         window.initialFirstResponder = video
-        window.contentAspectRatio = ViewGeometry.actualSize
-        window.contentMinSize = ViewGeometry.size(scale: 0.5)
+        window.collectionBehavior.insert(.fullScreenPrimary)
         window.isReleasedWhenClosed = false
-        if !window.setFrameUsingName("MainWindow") { window.center() }
-        window.setFrameAutosaveName("MainWindow")
+        if let name = frameAutosaveName {
+            if !window.setFrameUsingName(name) { window.center() }
+            window.setFrameAutosaveName(name)
+        }
+        applyPicture(resize: false)
         window.delegate = edgeGuard
         edgeGuard.apply(to: window)
-        window.level = UserDefaults.standard.bool(forKey: "alwaysOnTop") ? .floating : .normal
+        window.level = defaults.bool(forKey: "alwaysOnTop") ? .floating : .normal
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func buildMenu() {
+    func buildMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu()
@@ -182,6 +195,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alwaysOnTopItem.target = self
         alwaysOnTopItem.state = window.level == .floating ? .on : .off
         view.addItem(.separator())
+        for (option, title) in [(PictureOption.cropOverscan, "Crop Overscan"), (.integerScaling, "Integer Scaling"),
+                                (.scanlines, "Scanlines")] {
+            let item = view.addItem(withTitle: title, action: #selector(togglePicture(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = option
+            item.state = option.isEnabled(in: defaults) ? .on : .off
+            pictureItems[option] = item
+        }
+        let fullScreen = view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        fullScreen.keyEquivalentModifierMask = [.control, .command]
+        view.addItem(.separator())
         synergyItem = view.addItem(withTitle: "Switch Synergy on Click", action: #selector(toggleSynergy), keyEquivalent: "")
         synergyItem.target = self
         synergyItem.state = SynergySwitch.isEnabled() ? .on : .off
@@ -195,6 +219,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func actualSize() { window.setContentSize(ViewGeometry.size(scale: 1)) }
     @objc private func doubleSize() { window.setContentSize(ViewGeometry.size(scale: 2)) }
+
+    /// Pushes the picture options into the view and the window's aspect ratio. A change of the
+    /// crop keeps the window's width and follows the new aspect in height.
+    private func applyPicture(resize: Bool = true) {
+        let crop = PictureOption.cropOverscan.isEnabled(in: defaults) ? ViewGeometry.cropRect(in: defaults) : ViewGeometry.fullField
+        video.crop = crop
+        video.integerScaling = PictureOption.integerScaling.isEnabled(in: defaults)
+        video.scanlines = PictureOption.scanlines.isEnabled(in: defaults)
+        let size = ViewGeometry.displaySize(of: crop)
+        window.contentAspectRatio = size
+        window.contentMinSize = NSSize(width: size.width / 2, height: size.height / 2)
+        if resize, !window.styleMask.contains(.fullScreen) {
+            let width = window.contentRect(forFrameRect: window.frame).width
+            window.setContentSize(NSSize(width: width, height: width * size.height / size.width))
+        }
+    }
+
+    @objc private func togglePicture(_ sender: NSMenuItem) {
+        guard let option = sender.representedObject as? PictureOption else { return }
+        let on = !option.isEnabled(in: defaults)
+        option.setEnabled(on, in: defaults)
+        sender.state = on ? .on : .off
+        applyPicture()
+    }
 
     @objc private func toggleSynergy() {
         let on = !SynergySwitch.isEnabled()
@@ -213,6 +261,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let on = window.level != .floating
         window.level = on ? .floating : .normal
         alwaysOnTopItem.state = on ? .on : .off
-        UserDefaults.standard.set(on, forKey: "alwaysOnTop")
+        defaults.set(on, forKey: "alwaysOnTop")
     }
 }

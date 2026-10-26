@@ -3,7 +3,9 @@ import AmigaViewCore
 
 /// Shows the newest frame, aspect-fitted, with nearest-neighbour scaling, plus a status line.
 final class VideoView: NSView {
-    private let videoLayer = CALayer()
+    let videoLayer = CALayer()
+    /// Darkens the second display row of every field line; present only while Scanlines is on.
+    let scanlineLayer = CALayer()
     private let label = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
@@ -24,10 +26,12 @@ final class VideoView: NSView {
     /// Called on every mouseUp, including that of the click that activates the window. Not on
     /// mouseDown: Deskflow keeps input on the Mac while a button is held, so the edge crossing
     /// switchSynergy posts would be ignored.
-    var onClick: (() -> Void)?
+    /// Gets the click's location in screen coordinates.
+    var onClick: ((CGPoint) -> Void)?
 
     override func mouseUp(with event: NSEvent) {
-        onClick?()
+        onClick?(window?.convertPoint(toScreen: event.locationInWindow)
+                 ?? event.locationInWindow)
         super.mouseUp(with: event)
     }
 
@@ -59,6 +63,53 @@ final class VideoView: NSView {
         }
     }
 
+    /// The part of the field shown, in field pixels (see ViewGeometry.cropRect).
+    var crop = ViewGeometry.fullField {
+        didSet { applyPicture() }
+    }
+
+    var integerScaling = false {
+        didSet { needsLayout = true }
+    }
+
+    var scanlines = false {
+        didSet { applyPicture() }
+    }
+
+    /// Where the video is drawn, in view coordinates.
+    var videoFrame: CGRect { videoLayer.frame }
+
+    private func applyPicture() {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        videoLayer.contentsRect = ViewGeometry.contentsRect(for: crop)
+        if scanlines {
+            scanlineLayer.contents = Self.scanlineImage(fieldLines: Int(crop.height))
+            scanlineLayer.magnificationFilter = .nearest
+            scanlineLayer.minificationFilter = .nearest
+            scanlineLayer.contentsGravity = .resize
+            if scanlineLayer.superlayer == nil { layer?.insertSublayer(scanlineLayer, above: videoLayer) }
+        } else {
+            scanlineLayer.removeFromSuperlayer()
+            scanlineLayer.contents = nil
+        }
+        CATransaction.commit()
+        needsLayout = true
+    }
+
+    /// One pixel wide, two rows per field line, black with the alphas of ViewGeometry.scanlineAlphas.
+    static func scanlineImage(fieldLines: Int) -> CGImage? {
+        let alphas = ViewGeometry.scanlineAlphas(fieldLines: fieldLines)
+        guard !alphas.isEmpty else { return nil }
+        guard let ctx = CGContext(data: nil, width: 1, height: alphas.count, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        for (i, a) in alphas.enumerated() {   // row 0 is the top; CGContext's origin is the bottom
+            ctx.setFillColor(CGColor(gray: 0, alpha: a))
+            ctx.fill(CGRect(x: 0, y: alphas.count - 1 - i, width: 1, height: 1))
+        }
+        return ctx.makeImage()
+    }
+
     var status: String = "" {
         didSet { label.stringValue = " " + status + " "; needsLayout = true }
     }
@@ -66,7 +117,10 @@ final class VideoView: NSView {
     override func layout() {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        videoLayer.frame = ViewGeometry.fit(in: bounds.size)
+        let content = ViewGeometry.displaySize(of: crop)
+        videoLayer.frame = integerScaling ? ViewGeometry.integerFit(in: bounds.size, content: content)
+                                          : ViewGeometry.fit(in: bounds.size, content: content)
+        scanlineLayer.frame = videoLayer.frame
         CATransaction.commit()
         label.sizeToFit()
         label.frame.origin = NSPoint(x: 8, y: 8)

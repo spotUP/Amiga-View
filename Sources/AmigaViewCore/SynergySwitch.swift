@@ -43,6 +43,13 @@ public enum SynergySwitch {
         return frame.offsetBy(dx: limit - frame.maxX, dy: 0)
     }
 
+    /// Whether a click at `location` (screen coordinates) may switch. A full-screen window covers
+    /// the right edge, where Deskflow returns the pointer; a click that close to it would send the
+    /// input straight back to the Amiga.
+    public static func isClickClearOfEdge(at location: CGPoint, desktop: CGRect) -> Bool {
+        location.x < desktop.maxX - edgeClearance
+    }
+
     /// Whether a click at `now` should switch. `lastSent` is the time of the previous switch.
     public static func shouldSend(enabled: Bool, trusted: Bool, lastSent: TimeInterval?, now: TimeInterval) -> Bool {
         guard enabled, trusted else { return false }

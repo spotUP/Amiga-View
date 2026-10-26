@@ -33,7 +33,7 @@ final class VideoViewKeyTests: XCTestCase {
     func testClickSwitchesOnMouseUpNotMouseDown() {
         let view = VideoView(frame: .zero)
         var clicks = 0
-        view.onClick = { clicks += 1 }
+        view.onClick = { _ in clicks += 1 }
         func mouse(_ type: NSEvent.EventType) -> NSEvent {
             NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
                                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
