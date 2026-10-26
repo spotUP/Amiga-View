@@ -4,6 +4,17 @@ import Foundation
 /// reconnecting with StreamClient's backoff when the stream ends or is not served.
 public final class AudioStreamClient: NSObject, URLSessionDataDelegate {
     public static let sampleRate = 48000.0
+    public static let defaultsKey = "sound"
+
+    /// On by default; only an explicit false in the store turns the sound off.
+    public static func isEnabled(in store: UserDefaults = .standard) -> Bool {
+        store.object(forKey: defaultsKey) == nil ? true : store.bool(forKey: defaultsKey)
+    }
+
+    public static func setEnabled(_ on: Bool, in store: UserDefaults = .standard) {
+        store.set(on, forKey: defaultsKey)
+    }
+
     public let buffer: PCMJitterBuffer
     public private(set) var bytesReceived = 0
     public var onEvent: ((String) -> Void)?

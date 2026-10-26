@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusTimer: Timer?
     private var alwaysOnTopItem: NSMenuItem!
     private var synergyItem: NSMenuItem!
+    private var soundItem: NSMenuItem!
     private var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
     /// `--stats`: print frames decoded and drawn every 5 s to stderr, to measure the rate the app shows.
@@ -80,13 +81,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.client = c
                 c.start()
-                let a = AudioStreamClient(settings: s)
-                let p = AudioPlayer(buffer: a.buffer)
-                do { try p.start() } catch { NSLog("Amiga-View: audio output failed: \(error)") }
-                self.audio = a; self.player = p
-                a.start()
+                if AudioStreamClient.isEnabled() { self.startAudio() }
             }
         }
+    }
+
+    private func startAudio() {
+        guard audio == nil else { return }
+        let a = AudioStreamClient(settings: settings)
+        let p = AudioPlayer(buffer: a.buffer)
+        do { try p.start() } catch { NSLog("Amiga-View: audio output failed: \(error)") }
+        audio = a; player = p
+        a.start()
+    }
+
+    private func stopAudio() {
+        audio?.stop()
+        player?.stop()
+        audio = nil; player = nil
     }
 
     // MARK: Synergy switch
@@ -165,6 +177,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         synergyItem = view.addItem(withTitle: "Switch Synergy on Click", action: #selector(toggleSynergy), keyEquivalent: "")
         synergyItem.target = self
         synergyItem.state = SynergySwitch.isEnabled() ? .on : .off
+        view.addItem(.separator())
+        soundItem = view.addItem(withTitle: "Sound", action: #selector(toggleSound), keyEquivalent: "")
+        soundItem.target = self
+        soundItem.state = AudioStreamClient.isEnabled() ? .on : .off
         viewItem.submenu = view
         NSApp.mainMenu = main
     }
@@ -176,6 +192,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let on = !SynergySwitch.isEnabled()
         SynergySwitch.setEnabled(on)
         synergyItem.state = on ? .on : .off
+    }
+
+    @objc private func toggleSound() {
+        let on = !AudioStreamClient.isEnabled()
+        AudioStreamClient.setEnabled(on)
+        soundItem.state = on ? .on : .off
+        if on { startAudio() } else { stopAudio() }
     }
 
     @objc private func toggleOnTop() {

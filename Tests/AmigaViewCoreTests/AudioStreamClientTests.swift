@@ -29,4 +29,13 @@ final class AudioStreamClientTests: XCTestCase {
         XCTAssertEqual(r.map { Int(($0 * 32768).rounded()) }, [-1, -2, -3])
         client.stop()
     }
+
+    func testSoundOnByDefaultAndStored() {
+        let store = UserDefaults(suiteName: "AudioStreamClientTests-\(UUID().uuidString)")!
+        XCTAssertTrue(AudioStreamClient.isEnabled(in: store))
+        AudioStreamClient.setEnabled(false, in: store)
+        XCTAssertFalse(AudioStreamClient.isEnabled(in: store))
+        AudioStreamClient.setEnabled(true, in: store)
+        XCTAssertTrue(AudioStreamClient.isEnabled(in: store))
+    }
 }
