@@ -51,6 +51,14 @@ final class VideoView: NSView {
         }
     }
 
+    /// Accent-coloured border while the Amiga has the input.
+    var amigaHasInput = false {
+        didSet {
+            layer?.borderColor = NSColor.controlAccentColor.cgColor
+            layer?.borderWidth = amigaHasInput ? 4 : 0
+        }
+    }
+
     var status: String = "" {
         didSet { label.stringValue = " " + status + " "; needsLayout = true }
     }

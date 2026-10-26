@@ -20,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var soundItem: NSMenuItem!
     private var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
+    private lazy var deskflow = DeskflowMonitor(path: DeskflowLog.path(), clock: { ProcessInfo.processInfo.systemUptime },
+                                                trusted: { [weak self] in self?.accessibilityTrusted ?? false })
     /// `--stats`: print frames decoded and drawn every 5 s to stderr, to measure the rate the app shows.
     private let printStats = CommandLine.arguments.contains("--stats")
     private var statsDrawn = 0
@@ -123,6 +125,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshStatus() {
+        deskflow.poll()
+        video.amigaHasInput = deskflow.amigaHasInput
+        if let text = deskflow.overrideStatus { video.status = text; return }
         if SynergySwitch.isEnabled() && !accessibilityTrusted {
             video.status = SynergySwitch.untrustedStatus
             return

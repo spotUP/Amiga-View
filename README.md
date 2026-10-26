@@ -48,6 +48,12 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Switch Syne
 
 Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Synergy client on the A1200 receives input there. Place the Amiga-View window near the right edge of the Mac screen, so the pointer crosses the edge into "replay" close to the picture of the Amiga. The window always stays 16 points clear of that edge: Deskflow brings the pointer back from the Amiga just inside it, and a window there would catch the pointer so the next click sends input straight back to the Amiga. To leave the Amiga, move the pointer off its left edge; Cmd+Q and other Mac shortcuts go to the Amiga while it has the keyboard. Turn on "Always on Top" to keep the picture visible while you work.
 
+### Who has the input
+
+Amiga-View follows the Deskflow server log (`~/deskflow.log`, or the path in the `deskflowLog` default) from the end. While "replay" has the keyboard and mouse, the video gets a border in the system accent colour and the status line reads "Amiga has keyboard and mouse - leave off the left edge". Both go away when the input is back on the Mac.
+
+Deskflow sometimes believes a mouse button is held and then refuses to switch screens (it logs `locked by mouse buttonID: 0` over and over). When the log shows 3 such lines within 2 seconds while the Amiga has the input, and Accessibility is granted, Amiga-View posts one left mouseUp (at most once per 2 s) and shows "Released a stuck mouse button" for 3 s. This mitigates a Deskflow state bug whose root cause is still open.
+
 ### Switch Synergy on Click
 
 Clicking in the video window (also the click that activates it) moves keyboard and mouse to the Amiga: on release, Amiga-View posts mouse moves that carry the pointer across the right edge of the desktop, the same edge crossing that switches Deskflow by hand. No Deskflow hotkey is needed; Deskflow ignores posted hotkeys, so a switchToScreen keystroke cannot be triggered from the app.
