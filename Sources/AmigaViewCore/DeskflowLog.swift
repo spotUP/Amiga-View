@@ -40,6 +40,15 @@ public struct DeskflowState {
 
     public init() {}
 
+    /// The state the log says the screens are in: the newest `switch` line among `lines` (oldest
+    /// first), nothing else. Locks in the history must not count towards a release.
+    public init(history lines: [String]) {
+        for case .switched(let screen)? in lines.reversed().map(DeskflowLog.parse) {
+            apply(.switched(to: screen), at: 0)
+            break
+        }
+    }
+
     public mutating func apply(_ event: DeskflowEvent, at now: TimeInterval) {
         switch event {
         case .switched(let screen):
@@ -65,18 +74,32 @@ public struct DeskflowState {
 }
 
 /// Follows a growing file: new complete lines only, from the end at start; reopens on
-/// truncation or rotation.
+/// truncation or rotation. `history` holds the complete lines of the last `historyBytes` before that.
 public final class FileTail {
     private let path: String
     private var offset: UInt64
     private var inode: UInt64?
     private var partial = ""
+    public static let historyBytes: UInt64 = 64 * 1024
+    public let history: [String]
 
     public init(path: String) {
         self.path = path
         let a = try? FileManager.default.attributesOfItem(atPath: path)
-        offset = (a?[.size] as? UInt64) ?? 0
+        let size = (a?[.size] as? UInt64) ?? 0
+        offset = size
         inode = (a?[.systemFileNumber] as? UInt64)
+        var lines: [String] = []
+        let start = size > Self.historyBytes ? size - Self.historyBytes : 0
+        if size > 0, let h = FileHandle(forReadingAtPath: path) {
+            try? h.seek(toOffset: start)
+            let data = h.readData(ofLength: Int(size - start))
+            try? h.close()
+            lines = String(decoding: data, as: UTF8.self).components(separatedBy: "\n")
+            lines.removeLast()                              // empty, or unfinished
+            if start > 0, !lines.isEmpty { lines.removeFirst() }   // began mid-line
+        }
+        history = lines
     }
 
     public func readNewLines() -> [String] {

@@ -42,7 +42,13 @@ The tunnel is only started when `host` is `localhost` or `127.0.0.1` and `via` i
 
 ## Menu
 
-View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Switch Synergy on Click. The window keeps its 5:4 aspect ratio when resized.
+View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, Scanlines, Enter Full Screen (ctrl-cmd-F), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
+
+- Crop Overscan: shows only the area where the Amiga draws, 708x287 field pixels (the grabber's black margins on the right and bottom go away). Override the rectangle with the `cropX`, `cropY`, `cropWidth`, `cropHeight` defaults (field pixels, from the top left).
+- Integer Scaling: draws the picture at the largest whole multiple of its size that fits the window, centred on black; the normal fit when even 1x does not fit.
+- Scanlines: darkens the second display row of every field line by 35 percent.
+- Enter Full Screen: standard macOS full screen. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
+- Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`, `picture.scanlines`) and survives a restart.
 
 ## With Deskflow
 
@@ -50,7 +56,7 @@ Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Syn
 
 ### Who has the input
 
-Amiga-View follows the Deskflow server log (`~/deskflow.log`, or the path in the `deskflowLog` default) from the end. While "replay" has the keyboard and mouse, the video gets a border in the system accent colour and the status line reads "Amiga has keyboard and mouse - leave off the left edge". Both go away when the input is back on the Mac.
+Amiga-View follows the Deskflow server log (`~/deskflow.log`, or the path in the `deskflowLog` default). At start it reads the last 64 KB to learn who has the input (the newest `switch` line), then follows the end. While "replay" has the keyboard and mouse, the video gets a border in the system accent colour and the status line reads "Amiga has keyboard and mouse - leave off the left edge". Both go away when the input is back on the Mac.
 
 Deskflow sometimes believes a mouse button is held and then refuses to switch screens (it logs `locked by mouse buttonID: 0` over and over). When the log shows 3 such lines within 2 seconds while the Amiga has the input, and Accessibility is granted, Amiga-View posts one left mouseUp (at most once per 2 s) and shows "Released a stuck mouse button" for 3 s. This mitigates a Deskflow state bug whose root cause is still open.
 

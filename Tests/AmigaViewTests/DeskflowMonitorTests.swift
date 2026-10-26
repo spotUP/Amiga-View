@@ -40,4 +40,18 @@ final class DeskflowMonitorTests: XCTestCase {
         XCTAssertEqual(view.layer?.borderWidth, 0)
         XCTAssertNil(m.overrideStatus)
     }
+
+    /// The app starts while the Amiga already has the input: the first poll shows it.
+    func testStartWhileAmigaHasInputShowsBorder() throws {
+        let path = NSTemporaryDirectory() + UUID().uuidString + ".log"
+        try "[t] INFO: switch from \"BMS-MAC001\" to \"replay\" at 0,539\n[t] DEBUG: locked by mouse buttonID: 0\n"
+            .write(toFile: path, atomically: true, encoding: .utf8)
+        var releases = 0
+        let m = DeskflowMonitor(path: path, clock: { 100 }, trusted: { true }, postRelease: { releases += 1 })
+        let view = VideoView(frame: .zero)
+        m.poll(); view.amigaHasInput = m.amigaHasInput
+        XCTAssertGreaterThan(view.layer?.borderWidth ?? 0, 0)
+        XCTAssertEqual(m.overrideStatus, DeskflowMonitor.amigaStatus)
+        XCTAssertEqual(releases, 0)
+    }
 }

@@ -9,7 +9,7 @@ final class DeskflowMonitor {
     static let releasedStatusDuration: TimeInterval = 3
 
     private let tail: FileTail
-    private var state = DeskflowState()
+    private var state: DeskflowState
     private let clock: () -> TimeInterval
     private let trusted: () -> Bool
     private let postRelease: () -> Void
@@ -18,6 +18,7 @@ final class DeskflowMonitor {
     init(path: String, clock: @escaping () -> TimeInterval, trusted: @escaping () -> Bool,
          postRelease: @escaping () -> Void = DeskflowMonitor.postMouseUp) {
         tail = FileTail(path: path)
+        state = DeskflowState(history: tail.history)
         self.clock = clock; self.trusted = trusted; self.postRelease = postRelease
     }
 

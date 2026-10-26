@@ -43,4 +43,24 @@ final class DeskflowLogTests: XCTestCase {
         try "fresh\n".write(toFile: path, atomically: true, encoding: .utf8)
         XCTAssertEqual(tail.readNewLines(), ["fresh"])
     }
+
+    /// Started while the Amiga has the input: the newest switch line in the history wins, locks in
+    /// the history do not count, and only new lines are read afterwards.
+    func testHistoryGivesInitialState() throws {
+        let path = NSTemporaryDirectory() + UUID().uuidString + ".log"
+        let filler = String(repeating: "[t] DEBUG: noise line\n", count: 4000)   // pushes the first lines out of 64 KB
+        let log = "[t] INFO: switch from \"BMS-MAC001\" to \"replay\" at 0,5\n" + filler
+            + "[t] INFO: switch from \"replay\" to \"BMS-MAC001\" at 1796,5\n"
+            + "[t] INFO: switch from \"BMS-MAC001\" to \"replay\" at 0,9\n"
+            + String(repeating: "[t] DEBUG: locked by mouse buttonID: 0\n", count: 5)
+        try log.write(toFile: path, atomically: true, encoding: .utf8)
+        let tail = FileTail(path: path)
+        XCTAssertLessThanOrEqual(tail.history.count, 3200)
+        var s = DeskflowState(history: tail.history)
+        XCTAssertTrue(s.amigaHasInput)
+        XCTAssertFalse(s.shouldRelease(trusted: true, now: 1))
+        XCTAssertEqual(tail.readNewLines(), [])
+        XCTAssertFalse(DeskflowState(history: ["[t] DEBUG: x"]).amigaHasInput)
+        XCTAssertFalse(DeskflowState(history: ["[t] INFO: switch from \"replay\" to \"BMS-MAC001\" at 1,1"]).amigaHasInput)
+    }
 }
