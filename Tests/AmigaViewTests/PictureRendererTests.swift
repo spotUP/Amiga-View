@@ -114,4 +114,17 @@ final class PictureRendererTests: XCTestCase {
         let video = VideoView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
         XCTAssertEqual(video.metalLayer.colorspace?.name as String?, CGColorSpace.sRGB as String)
     }
+
+    /// Mega Bezel shows an intro (logo, static, solid colour) when the shader loads; the app turns it off.
+    func testLoadedMegaBezelChainHasTheIntroTurnedOff() throws {
+        let preset = URL(fileURLWithPath: LibrashaderBridgeTests.preset)
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: preset.path), "\(preset.path) is missing; run scripts/fetch-shaders.sh")
+        let video = VideoView(frame: NSRect(x: 0, y: 0, width: 720, height: 576))
+        try XCTSkipIf(video.renderer == nil, "no Metal device")
+        video.shaderPreset = preset
+        let deadline = Date().addingTimeInterval(120)
+        while video.shaderState == .loading, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        XCTAssertEqual(video.shaderState, .ready)
+        XCTAssertEqual(try XCTUnwrap(video.chain).parameter("HSM_INTRO_WHEN_TO_SHOW")?.floatValue, 0)
+    }
 }

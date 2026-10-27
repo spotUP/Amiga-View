@@ -19,6 +19,8 @@ extern libra_error_t libra_mtl_filter_chain_frame(libra_mtl_filter_chain_t *chai
                                                   const struct frame_mtl_opt_t *opt);
 extern libra_error_t libra_mtl_filter_chain_set_param(libra_mtl_filter_chain_t *chain,
                                                       const char *param_name, float value);
+extern libra_error_t libra_mtl_filter_chain_get_param(const libra_mtl_filter_chain_t *chain,
+                                                      const char *param_name, float *out);
 extern libra_error_t libra_mtl_filter_chain_free(libra_mtl_filter_chain_t *chain);
 extern int32_t libra_error_errno(libra_error_t error);
 extern int32_t libra_error_write(libra_error_t error, char **out);
@@ -88,6 +90,13 @@ static BOOL LBCheck(libra_error_t err, NSString *what, NSError **out) {
 - (void)setParameter:(NSString *)name value:(float)value {
     libra_error_t err = libra_mtl_filter_chain_set_param(&_chain, name.UTF8String, value);
     if (err) libra_error_free(&err);
+}
+
+- (nullable NSNumber *)parameter:(NSString *)name {
+    float value = 0;
+    libra_error_t err = libra_mtl_filter_chain_get_param(&_chain, name.UTF8String, &value);
+    if (err) { libra_error_free(&err); return nil; }
+    return @(value);
 }
 
 - (void)dealloc {

@@ -26,6 +26,9 @@ extern NSErrorDomain const LBFilterChainErrorDomain;
 
 - (void)setParameter:(NSString *)name value:(float)value;
 
+/// The current value of a shader parameter, or nil when the chain has no parameter of that name.
+- (nullable NSNumber *)parameter:(NSString *)name;
+
 @end
 
 NS_ASSUME_NONNULL_END

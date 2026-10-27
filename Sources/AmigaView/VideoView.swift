@@ -116,7 +116,12 @@ final class VideoView: NSView {
             let generation = loadGeneration, queue = renderer.queue, wanted = wantedGeneration, load = chainLoader
             loadQueue.async { [weak self] in
                 guard wanted.value == generation else { return }
-                let result = Result { try load(url.path, queue) }
+                let result = Result { () throws -> LBFilterChain in
+                    let c = try load(url.path, queue)
+                    // Mega Bezel's intro (logo, static, solid colour) would play on every shader load.
+                    c.setParameter("HSM_INTRO_WHEN_TO_SHOW", value: 0)
+                    return c
+                }
                 DispatchQueue.main.async {
                     guard let self, generation == self.loadGeneration else { return }
                     switch result {
