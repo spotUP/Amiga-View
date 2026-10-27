@@ -53,6 +53,7 @@ What the setup needs:
 
     swift build            # debug build
     swift test             # unit tests and end-to-end stream test (local test server, no Pi needed)
+    python3 -I -m unittest discover -s Tests/scripts   # test of the shader include walker
     scripts/bundle.sh      # release build into build/Amiga-View.app, with the icon drawn by scripts/make-icon.swift
     open build/Amiga-View.app
     scripts/bundle.sh --release   # same build, then build/Amiga-View-<version>.zip (version from Resources/Info.plist)
@@ -97,13 +98,13 @@ Amiga-View: Settings... (cmd-,; see Settings).
 
 Amiga: Reset Amiga... (see Reset).
 
-View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, Scanlines, Enter Full Screen (ctrl-cmd-F), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
+View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, CRT Shader, Enter Full Screen (ctrl-cmd-F), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
 
 - Crop Overscan: shows only the area where the Amiga draws, 708x287 field pixels (the grabber's black margins on the right and bottom go away). Override the rectangle with the `cropX`, `cropY`, `cropWidth`, `cropHeight` defaults (field pixels, from the top left).
 - Integer Scaling: draws the picture at the largest whole multiple of its size that fits the window, centred on black; the normal fit when even 1x does not fit.
-- Scanlines: darkens the second display row of every field line by 35 percent.
+- CRT Shader: a submenu with Off and nine Mega Bezel presets (Smooth Advanced Glass, Smooth Advanced, Advanced, Advanced Glass, Advanced Without Reflection, Standard Glass, Standard, Standard Without Reflection, Potato). It draws the picture through that preset, with scanlines, phosphor mask, curvature and a reflecting bezel. Standard is the default; Off shows the plain picture. The status line says "Loading CRT shader..." while a preset loads, which can take many seconds the first time. The choice is stored as `picture.crtShader` and survives a restart.
 - Enter Full Screen: standard macOS full screen. Press Esc or ctrl-cmd-F to leave it (the status line says so for 3 s on entering); keys only reach the Mac while it has the input. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
-- Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`, `picture.scanlines`) and survives a restart.
+- Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`) and survives a restart.
 
 ## Toolbar
 
@@ -141,6 +142,15 @@ Deskflow sometimes believes a mouse button is held and then refuses to switch sc
 Clicking in the video window (also the click that activates it) moves keyboard and mouse to the Amiga: on release, Amiga-View posts mouse moves that carry the pointer across the right edge of the desktop, the same edge crossing that switches Deskflow by hand. No Deskflow hotkey is needed; Deskflow ignores posted hotkeys, so a switchToScreen keystroke cannot be triggered from the app.
 
 Grant Accessibility to Amiga-View (System Settings, Privacy and Security, Accessibility); without it the status line shows "Grant Accessibility to switch Synergy on click" and the click does nothing. At most one switch per 500 ms. Turn it off in View, "Switch Synergy on Click" (stored as `switchSynergyOnClick`, default on). To return, move the mouse off the Amiga's left edge.
+
+## Third-party components
+
+The app itself stays MIT. The CRT Shader menu uses two parts from other projects, both shipped unchanged in the app bundle:
+
+- librashader v0.12.1, which runs the shader presets on Metal (`Contents/Frameworks/librashader.dylib`, built by `scripts/librashader.sh`). It is licensed MPL-2.0 OR GPL-3.0-only; Amiga-View uses it under MPL-2.0. Source: https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.1
+- The Mega Bezel presets and the shader files they need from libretro/slang-shaders, pinned to commit cb8e5341db3bb6ef4a34003f581c831eb8bd6cf2 (`Contents/Resources/shaders`, fetched by `scripts/fetch-shaders.sh`). They are GPL-3.0, some files GPL-2.0 or later. Source: https://github.com/libretro/slang-shaders
+
+The licence texts are in `Contents/Resources/shaders/licenses` inside the app.
 
 ## Licence
 

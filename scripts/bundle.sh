@@ -22,6 +22,11 @@ cp Resources/wasabi/wasabi.py "$APP/Contents/Resources/wasabi.py"
 # Mega Bezel shader presets for View > CRT Shader, fetched by scripts/fetch-shaders.sh
 [ -d build/shaders ] || scripts/fetch-shaders.sh
 cp -R build/shaders "$APP/Contents/Resources/shaders"
+# Licence texts shipped with the third-party parts: librashader's MPL-2.0 (the dylib, unmodified) and
+# the GPL-3.0 (Mega Bezel and slang-shaders), both taken from the librashader source scripts/librashader.sh fetched.
+mkdir -p "$APP/Contents/Resources/shaders/licenses"
+cp build/librashader-src/LICENSE.md "$APP/Contents/Resources/shaders/licenses/librashader-MPL-2.0.md"
+cp build/librashader-src/LICENSE-GPL.md "$APP/Contents/Resources/shaders/licenses/GPL-3.0.md"
 rm -rf build/AppIcon.iconset
 swift scripts/make-icon.swift build/AppIcon.iconset
 iconutil -c icns build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
