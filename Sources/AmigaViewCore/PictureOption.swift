@@ -12,7 +12,7 @@ public enum PictureOption: String, CaseIterable {
 }
 
 /// The View menu's CRT Shader choice: one Mega Bezel preset, or none (the plain picture). Stored
-/// in UserDefaults; none by default.
+/// in UserDefaults; Standard when nothing is stored, and a stored Off stays Off.
 public enum CRTShader: String, CaseIterable {
     case smoothAdvancedGlass = "MBZ__0__SMOOTH-ADV-GLASS", smoothAdvanced = "MBZ__0__SMOOTH-ADV"
     case advanced = "MBZ__1__ADV", advancedGlass = "MBZ__2__ADV-GLASS", advancedNoReflection = "MBZ__2__ADV-NO-REFLECT"
@@ -35,12 +35,17 @@ public enum CRTShader: String, CaseIterable {
         }
     }
 
+    public static let `default`: CRTShader = .standard
+    /// What is stored for Off; an absent value means the default, so Off needs a value of its own.
+    static let offValue = "off"
+
     public static func selected(in store: UserDefaults = .standard) -> CRTShader? {
-        store.string(forKey: defaultsKey).flatMap(CRTShader.init(rawValue:))
+        guard let stored = store.string(forKey: defaultsKey) else { return .default }
+        return CRTShader(rawValue: stored)
     }
 
     public static func select(_ shader: CRTShader?, in store: UserDefaults = .standard) {
-        store.set(shader?.rawValue, forKey: defaultsKey)
+        store.set(shader?.rawValue ?? offValue, forKey: defaultsKey)
     }
 
     /// The preset file below the shaders folder.

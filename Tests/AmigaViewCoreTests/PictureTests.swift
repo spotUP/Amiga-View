@@ -70,13 +70,14 @@ final class PictureTests: XCTestCase {
                        (2832.0 * 1080 / 2296).rounded())
     }
 
-    func testCRTShaderChoiceIsStoredAndOffByDefault() {
+    func testCRTShaderChoiceIsStoredAndStandardByDefault() {
         let d = store()
-        XCTAssertNil(CRTShader.selected(in: d))
-        CRTShader.select(.standard, in: d)
-        XCTAssertEqual(CRTShader.selected(in: d), .standard)
+        XCTAssertEqual(CRTShader.selected(in: d), .standard)       // nothing stored: Standard
+        XCTAssertEqual(CRTShader.standard.rawValue, "MBZ__3__STD")
+        CRTShader.select(.potato, in: d)
+        XCTAssertEqual(CRTShader.selected(in: d), .potato)
         CRTShader.select(nil, in: d)
-        XCTAssertNil(CRTShader.selected(in: d))
+        XCTAssertNil(CRTShader.selected(in: d))                     // a stored Off stays Off
         XCTAssertEqual(CRTShader.allCases.count, 9)
         XCTAssertEqual(Set(CRTShader.allCases.map(\.title)).count, 9)
     }
