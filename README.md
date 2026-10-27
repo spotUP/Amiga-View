@@ -2,6 +2,8 @@
 
 A small native macOS app that shows the live video of a real Amiga A1200, so you can test without walking to it. It only shows video. Keyboard and mouse control stay with Synergy / Deskflow.
 
+![Amiga-View in full screen, showing UP-Term on the A1200 through the Mega Bezel CRT shader](docs/screenshot.png)
+
 ## How it works
 
 A Raspberry Pi 4 grabber runs `camserver.py` (from Up_Rough_Demo_System, `tools/amiga_cam`) and listens on the Pi's localhost only:
