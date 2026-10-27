@@ -37,6 +37,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Full screen state and exit. Injected so tests need no real full-screen transition.
     lazy var isFullScreen: () -> Bool = { [weak self] in self?.window.styleMask.contains(.fullScreen) ?? false }
     lazy var exitFullScreen: () -> Void = { [weak self] in self?.window.toggleFullScreen(nil) }
+    /// Asks before a reset; replaced by tests.
+    lazy var confirmReset: () -> Bool = {
+        let alert = NSAlert()
+        alert.messageText = AmigaReset.confirmText
+        alert.informativeText = AmigaReset.confirmDetail
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+    /// Environment for the wasabi client; nil inherits the app's. Tests point it at a temp config.
+    var resetEnvironment: [String: String]?
+    /// Runs on the main queue with the status text when a reset finishes; replaced by tests.
+    var resetFinished: ((String) -> Void)?
     static let fullScreenHint = "Press Esc or Control-Command-F to leave full screen"
     var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
@@ -152,6 +165,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let url = CaptureFile.url(in: snapshotDirectory, date: Date(), ext: "png")
         do { try png.write(to: url); showFlash("Saved \(url.lastPathComponent)") }
         catch { showFlash("Snapshot failed: \(error.localizedDescription)") }
+    }
+
+    @objc private func resetAmiga() {
+        guard confirmReset() else { return }
+        showFlash(AmigaReset.startedStatus)
+        AmigaReset.load(from: defaults).run(script: AmigaReset.scriptURL(), environment: resetEnvironment) { [weak self] text in
+            self?.showFlash(text)
+            self?.resetFinished?(text)
+        }
     }
 
     @objc private func toggleRecording() {
@@ -301,6 +323,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         soundItem.target = self
         soundItem.state = AudioStreamClient.isEnabled() ? .on : .off
         viewItem.submenu = view
+
+        let amigaItem = NSMenuItem(); main.addItem(amigaItem)
+        let amiga = NSMenu(title: "Amiga")
+        amiga.addItem(withTitle: "Reset Amiga...", action: #selector(resetAmiga), keyEquivalent: "").target = self
+        amigaItem.submenu = amiga
         NSApp.mainMenu = main
     }
 

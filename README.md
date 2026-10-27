@@ -42,6 +42,8 @@ The tunnel is only started when `host` is `localhost` or `127.0.0.1` and `via` i
 
 ## Menu
 
+Amiga: Reset Amiga... (see Reset).
+
 View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, Scanlines, Enter Full Screen (ctrl-cmd-F), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
 
 - Crop Overscan: shows only the area where the Amiga draws, 708x287 field pixels (the grabber's black margins on the right and bottom go away). Override the rectangle with the `cropX`, `cropY`, `cropWidth`, `cropHeight` defaults (field pixels, from the top left).
@@ -56,6 +58,17 @@ The File menu saves what the window shows.
 
 - **Save Snapshot** (cmd-S) writes the newest frame as a PNG to the Desktop, named `Amiga-View 2026-10-27 at 14.03.09.png`. It is the displayed picture: every line doubled (720x576), cropped when Crop Overscan is on.
 - **Start Recording** / **Stop Recording** (cmd-R) writes `Amiga-View <date> at <time>.mov` to Movies: H.264 video at the displayed size, plus AAC sound when Sound is on. Picture times follow frame arrival, so a stalled stream shows as a pause; sound is timed by sample count from the first frame. The status line shows `Recording 00:12` and the frame rate. Quitting finishes the file. A frame backlog is dropped rather than slowing the display.
+
+## Reset
+
+Amiga > Reset Amiga... asks first, then reboots the A1200 through wasabid, the daemon running on it (its REBOOT verb calls ColdReboot). Sending Ctrl-Amiga-Amiga over Synergy does not work: that reset is wired in the A1200's keyboard hardware, and keys that come over the network never pass through it.
+
+The app runs the vendored wasabi client (`Resources/wasabi/wasabi.py`, copied into the app bundle) with `/usr/bin/python3`. It always names the host, because without one wasabi searches the network and also finds wasabid inside emulators on this Mac. The status line shows "Resetting the Amiga", then "Amiga is rebooting" or "Reset failed: reason".
+
+    defaults write com.spotup.amiga-view amigaHost 192.168.0.66
+    defaults write com.spotup.amiga-view amigaPort -int 1234
+
+The key comes from wasabi's own config, `~/.config/wasabi/config` (`key = ...`).
 
 ## With Deskflow
 

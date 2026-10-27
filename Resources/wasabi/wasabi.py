@@ -1,0 +1,4547 @@
+#!/usr/bin/env python3
+"""wasabi - drive a real Amiga over the network.
+
+Talks to wasabid on the Amiga side. See PROTOCOL.md for the wire format.
+
+    wasabi run "Version FULL"
+    wasabi put ccon-handler L:ccon-handler --force
+    wasabi deploy ccon-handler L:ccon-handler --force --reboot
+    wasabi debug
+    wasabi snoop --task cfile
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import select
+import signal
+import zlib
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = 1
+MAX_PAYLOAD = 65536
+
+# --- tags -------------------------------------------------------------
+
+HELLO, WELCOME, ERR, OK, PING, PONG = 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
+PUT, GET, DATA, END, LS, DEL, MKDIR = 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16
+RUN, STDOUT, STDERR, EXIT = 0x20, 0x21, 0x22, 0x23
+DEBUG, SNOOP, LOG = 0x30, 0x31, 0x32
+REBOOT, INFO, RESTART, PS, KILL, SPEED = 0x40, 0x41, 0x42, 0x43, 0x44, 0x45
+QUIT, INSTALL, GRAB, SCREEN, MOUSE = 0x46, 0x47, 0x48, 0x49, 0x4A
+KEY, WINDOWS, HEALTH, LIVE, CLIP = 0x4B, 0x4C, 0x4D, 0x4E, 0x4F
+SLOTS, FREE, SLOT = 0x50, 0x51, 0x52
+UI, UIACT, AREXX, PORTS = 0x53, 0x54, 0x55, 0x56   # daemon 0.5+
+SUM = 0x57                       # daemon 0.9 (updated 15.10.2026)+
+INPUTS = 0x58                    # daemon 0.10b4+
+FREE_BREAK_ONLY = 1
+RUN_SLOT = 4            # RUN flag: tell me which slot (daemon 0.4+)
+
+# Amiga DateStamp epoch.
+AMIGA_EPOCH = 252460800  # 1978-01-01 00:00:00 UTC as a Unix timestamp
+
+# Protection bits: the low nibble is ACTIVE LOW (set == denied).
+PROT_DEFAULT = 0xFFFFFFFF
+
+
+class WasabiError(Exception):
+    pass
+
+
+# Exit codes, so a script (or Claude) can tell the failures apart
+# without reading the words. 1 = the command failed or the Amiga said
+# no; 2 = the Amiga could not be reached, or the command line was
+# wrong; the two below are borrowed from GNU timeout, high enough never
+# to be mistaken for an AmigaDOS return code (0, 5, 10, 20).
+EXIT_TIME_LIMIT = 124       # a --max-time / --timeout ran out
+EXIT_SILENT = 125           # the Amiga stopped answering
+
+
+class TimeLimit(WasabiError):
+    """A limit the caller set ran out - not a fault."""
+
+
+class AmigaSilent(WasabiError):
+    """Connected, then nothing came back for too long."""
+
+
+# How long any one reply may take before the Amiga counts as not
+# answering. --silence and WASABI_SILENCE override it.
+SILENCE = 15.0
+
+# TLS 1.3 whenever this computer has keys and the Amiga offers it
+# (wasabid 0.6+ with AmiSSL); see Conn. --plain: not this time.
+PLAIN = False
+
+# Coordinates: by default the picture's pixels - grab doubles a 640x256
+# screen's rows to keep its shape, and every position follows the
+# picture. NATIVE (--native, coords = native): the screen's own pixels
+# everywhere instead, as amiagent and Intuition count them.
+NATIVE = False
+
+# Volumes and assigns where a wrong delete or overwrite costs a boot.
+# `put`, `deploy` and `del` there need --force. More names (the boot
+# volume's own name, say) go in the config file: protect = AmigaOS,Work
+SYSTEM_PLACES = {"sys", "c", "l", "libs", "devs", "s", "fonts", "locale",
+                 "envarc", "kickstart"}
+
+
+def system_place(path, extra=()):
+    """The volume or assign a path is on, if that is a protected one."""
+    vol, colon, _ = path.partition(":")
+    if not colon:
+        return None                     # relative: wherever the daemon is
+    v = vol.strip().lower()
+    if v in SYSTEM_PLACES or v in extra:
+        return vol + ":"
+    return None
+
+
+def check_system_place(args, path, verb):
+    place = system_place(path, getattr(args, "protect", ()))
+    if place and not getattr(args, "force", False):
+        raise WasabiError(
+            "%s is in %s, a system place - a mistake there can stop the "
+            "Amiga booting. Pass --force to %s it anyway"
+            % (path, place, verb))
+
+
+def emit_json(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+# --- wire -------------------------------------------------------------
+
+
+def pack_str(s):
+    b = s.encode("latin-1", "replace") if isinstance(s, str) else s
+    return struct.pack(">H", len(b)) + b
+
+
+def unpack_str(buf, off=0):
+    (n,) = struct.unpack_from(">H", buf, off)
+    off += 2
+    return buf[off:off + n].decode("latin-1"), off + n
+
+
+# AmigaDOS error names, for dressing a bare code wherever one surfaces:
+# snoop's "fail (err 205)", run's IoErr, the daemon's error frames.
+# Wording follows the classic AmigaDOS manual where it names a code
+# (per bambi-amiga.co.uk/amigahistory/codes.html), dos/dos.h otherwise.
+DOS_ERRORS = {
+    103: "Insufficient free store",
+    105: "Task table full",
+    114: "Bad template",
+    115: "Bad number",
+    116: "Required argument missing",
+    117: "Keyword needs an argument",
+    118: "Too many arguments",
+    119: "Unmatched quotes",
+    120: "Argument line invalid or too long",
+    121: "File is not an object module",
+    122: "Invalid resident library during load",
+    201: "No default directory",
+    202: "Object in use",
+    203: "Object already exists",
+    204: "Directory not found",
+    205: "Object not found",
+    206: "Invalid window description",
+    207: "Object too large",
+    209: "Packet request type unknown",
+    210: "Invalid stream component name",
+    211: "Invalid object lock",
+    212: "Object not of required type",
+    213: "Disk not validated",
+    214: "Disk write protected",
+    215: "Rename across device attempted",
+    216: "Directory not empty",
+    217: "Too many levels",
+    218: "Device not mounted",
+    219: "Seek error",
+    220: "Comment too big",
+    221: "Disk full",
+    222: "File is protected from deletion",
+    223: "File is protected from writing",
+    224: "File is protected from reading",
+    225: "Not a DOS disk",
+    226: "No disk in drive",
+    232: "No more entries in directory",
+    233: "Object is a soft link",
+    234: "Object is linked",
+    235: "Bad loadfile hunk",
+    236: "Action not implemented",
+    240: "Record not locked",
+    241: "Lock collision",
+    242: "Lock timeout",
+    243: "Unlock error",
+    # dos/dosasl.h, not dos/dos.h - 304 is a Ctrl-C'd command and 305 is
+    # a file whose E bit is clear, both routine in a trace
+    303: "Buffer overflow",
+    304: "Break",
+    305: "File is not executable",
+}
+
+SNOOPF_ENTRY = 1                # SNOOP flags word, bit 0
+
+# What --output minimal hides: high-volume, low-signal calls that every
+# Amiga makes constantly. The shell probes these five variables before
+# every command; FindTask(NULL) is how a program asks "who am I"; the
+# DOpus port probe is in half the software ever written; and
+# bsdsocket's WaitSelect opens dos.library once per daemon poll, which
+# is 20 lines a second on its own. Each is listed here rather than
+# guessed at, and the stream says it is filtering when it does.
+NOISE_RE = re.compile(
+    r'(GetVar|SetVar)\("(echo|debug|oldredirect|interactive|simpleshell|'
+    r'SHELLCOMPLETION|HISTSIZE|RC|Result2|process)"\)'
+    r'|FindTask\('
+    r'|FindPort\("Directory Opus"\)'
+    r'|OpenLibrary\("dos\.library"')
+
+# --ignore-wasabi: the tool's own footprint, so a trace shows the thing
+# being debugged rather than the machinery watching it. The daemon
+# already omits its own task, but not the runner it spawns to carry out
+# `wasabi run`, the sidecar a `wasabi update` leaves lying about, or the
+# temp file the runner streams output through.
+#
+# Deliberately NOT hidden: anything the daemon says on purpose - the
+# guru report, the lost-frame counts, the farewell. Those are wasabi's
+# voice, not its noise, and they are usually the reason a stream is
+# open at all.
+WASABI_SELF_RE = re.compile(
+    r'^\S*wasabid(\.new|\.bak|\.old)?\s'
+    r'|^wasabi-runner\s'          # its ln_Name, when it has no CLI name
+    r'|T:wasabi-run-'
+    r'|^\[wasabi: \d+\.\d+\.\d+\.\d+ connected\]')
+
+_ERR_RE = re.compile(r"\(err (\d+)\)")
+
+
+def dos_error(code):
+    """205 -> 'Error 205: Object not found'; an unknown code stays bare."""
+    name = DOS_ERRORS.get(code)
+    return "Error %d: %s" % (code, name) if name else "error %d" % code
+
+
+# Guru meditation decoding, from exec/alerts.h. Subsystem 0 is the CPU
+# exception group (8000 0004 = illegal instruction); everything else is
+# subsystem byte + general-cause byte, with exact names for the exec
+# memory alerts a mungwall hunt most wants to recognize.
+CPU_ALERTS = {
+    0x02: "bus error", 0x03: "address error", 0x04: "illegal instruction",
+    0x05: "divide by zero", 0x06: "CHK instruction",
+    0x07: "TRAPV instruction", 0x08: "privilege violation", 0x09: "trace",
+    0x0A: "line-A emulator", 0x0B: "line-F emulator",
+    0x0E: "stack frame format error", 0x18: "spurious interrupt",
+    0x19: "autovector level 1", 0x1A: "autovector level 2",
+    0x1B: "autovector level 3", 0x1C: "autovector level 4",
+    0x1D: "autovector level 5", 0x1E: "autovector level 6",
+    0x1F: "autovector level 7",
+}
+
+ALERT_SPECIFIC = {                       # deadend bit stripped
+    0x01000003: "exec: library checksum failure",
+    0x01000005: "exec: corrupt memory list detected in FreeMem",
+    0x01000006: "exec: no memory for interrupt servers",
+    0x01000008: "exec: semaphore in an illegal state",
+    0x01000009: "exec: freeing memory already freed",
+    0x0100000B: "exec: attempt to reuse active IORequest",
+    0x0100000C: "exec: sanity check on memory list failed",
+    0x0100000D: "exec: IO attempted on closed IORequest",
+    0x0100000E: "exec: stack out of range",
+    0x0100000F: "exec: bad address passed to FreeMem",
+}
+
+ALERT_SUBSYS = {
+    0x01: "exec.library", 0x02: "graphics.library", 0x03: "layers.library",
+    0x04: "intuition.library", 0x05: "math libraries", 0x07: "dos.library",
+    0x08: "ramlib", 0x09: "icon.library", 0x0A: "expansion.library",
+    0x0B: "diskfont.library", 0x10: "audio.device", 0x11: "console.device",
+    0x12: "gameport.device", 0x13: "keyboard.device",
+    0x14: "trackdisk.device", 0x15: "timer.device", 0x20: "cia resource",
+    0x21: "disk resource", 0x22: "misc resource", 0x30: "bootstrap",
+    0x31: "workbench", 0x32: "diskcopy", 0x33: "gadtools.library",
+    0x34: "utility.library", 0x35: "unknown subsystem",
+}
+
+ALERT_CAUSE = {
+    0x01: "no memory", 0x02: "MakeLibrary failed",
+    0x03: "OpenLibrary failed", 0x04: "OpenDevice failed",
+    0x05: "OpenResource failed", 0x06: "I/O error",
+    0x07: "no signal available", 0x08: "bad parameter",
+    0x09: "library closed too often", 0x0A: "device closed too often",
+    0x0B: "process creation failed",
+}
+
+_ALERT_RE = re.compile(r"ALERT #([0-9a-fA-F]{8})(?![0-9a-fA-F])(?! \()")
+
+
+def guru_decode(code):
+    """80000004 -> 'CPU: illegal instruction'; None when unrecognized."""
+    c = code & 0x7FFFFFFF
+    if (c >> 24) == 0:
+        name = CPU_ALERTS.get(c & 0xFFFF)
+        return "CPU: %s" % name if name else None
+    if c in ALERT_SPECIFIC:
+        return ALERT_SPECIFIC[c]
+    sub = ALERT_SUBSYS.get(c >> 24)
+    cause = ALERT_CAUSE.get((c >> 16) & 0xFF)
+    if sub and cause:
+        return "%s: %s" % (sub, cause)
+    return sub
+
+
+def dress_alerts(text):
+    """Put a name to a guru's alert code."""
+    def alert(m):
+        name = guru_decode(int(m.group(1), 16))
+        return "ALERT #%s (%s)" % (m.group(1), name) if name else m.group(0)
+    return _ALERT_RE.sub(alert, text)
+
+
+def dress_errors(text):
+    """The full treatment for the STREAM, on screen and in the log
+    alike: '(err 205)' becomes '(Error 205: Object not found)' on top
+    of the alert decoding - the stream is forensic, and its reader
+    should never have to look a code up. `run` output stays untouched:
+    there the failing command speaks for itself. Idempotent."""
+    text = _ERR_RE.sub(lambda m: "(%s)" % dos_error(int(m.group(1))), text)
+    return dress_alerts(text)
+
+
+class Conn:
+    def __init__(self, host, port, key, timeout=None, tls=None):
+        """tls None: decide - encrypted whenever this computer has keys and
+        the Amiga is not this computer itself; plain to an Amiga without
+        encryption, unless it was reached encrypted before (then refuse:
+        something may be pretending to be it). True/False: exactly that."""
+        if timeout is None:
+            timeout = SILENCE
+        self.host, self.port, self.key = host, port, key
+        self.buf = b""
+        auto = tls is None
+        self.sock = self._open(host, port, timeout)
+        peer = self.sock.getpeername()[0]
+        if auto:
+            if PLAIN or not want_tls(peer):
+                tls = False
+            elif not have_keys():
+                if tls_pinned(peer, port):
+                    self.sock.close()
+                    raise WasabiError(
+                        "%s was reached encrypted before, but this computer "
+                        "has no Wasabi keys (%s) - copy the keys folder from "
+                        "the computer that has them. If that Amiga has no "
+                        "encryption now on purpose: 'wasabi keys forget %s' "
+                        "(or --plain for one command)"
+                        % (peer, keys_dir(), peer))
+                tls = False
+            else:
+                tls = True
+        self.tls = tls
+        if tls:
+            try:
+                self._wrap(timeout)
+            except _NoTLSThere:
+                self.sock.close()
+                if not auto:
+                    raise WasabiError(
+                        "the Amiga closed the connection during the TLS "
+                        "handshake - it has no encryption (no AmiSSL or no "
+                        "keys there, or a wasabid older than 0.6)")
+                if tls_pinned(peer, port):
+                    raise WasabiError(
+                        "%s:%d was reached encrypted before and now offers "
+                        "no encryption - its AmiSSL or keys are gone, or "
+                        "something is pretending to be it. Refusing plain. "
+                        "If it has no encryption on purpose (no AmiSSL, "
+                        "or another Amiga now answers there): 'wasabi keys "
+                        "forget %s' makes it plain again (or --plain for "
+                        "one command)" % (peer, port, peer))
+                plain_warning(peer)
+                self.sock = self._open(host, port, timeout)
+                self.tls = False
+        try:
+            try:
+                self._hello(key, timeout)
+            except ssl.SSLError as e:
+                # TLS 1.3: the Amiga checks our certificate after we think
+                # the handshake is done, so its "no" arrives here.
+                raise WasabiError(
+                    "the Amiga does not trust this computer's certificate "
+                    "(%s) - copy the keys folder from the computer that "
+                    "made them, or install a new set with 'wasabi keys "
+                    "amiga'" % (e.reason or e))
+        except BaseException:
+            self.sock.close()           # a refused HELLO must not leak
+            raise                       # the socket (audit 4)
+        if self.tls and auto:
+            tls_pin(peer, port)
+
+    @staticmethod
+    def _open(host, port, timeout):
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Keepalive, tuned tight: a machine that is reset or freezes
+        # mid-connection sends no FIN, and a blocking recv() would wait
+        # on it forever. ~25 s of unanswered probes declares it dead.
+        # macOS spells the idle-time option TCP_KEEPALIVE where Linux
+        # says TCP_KEEPIDLE; missing either would quietly leave the
+        # 2-hour system default, which is no keepalive at all.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle = getattr(socket, "TCP_KEEPIDLE",
+                       getattr(socket, "TCP_KEEPALIVE", None))
+        if idle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, idle, 10)
+        for opt, val in (("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, opt):    # absent on Windows; skip
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+        return sock
+
+    def _wrap(self, timeout):
+        try:
+            self.sock = tls_context().wrap_socket(self.sock)
+        except ssl.SSLCertVerificationError as e:
+            self.sock.close()
+            raise WasabiError(
+                "this is not one of your Amigas - its certificate is "
+                "not signed by your Wasabi CA (%s)" % e.verify_message)
+        except ssl.SSLError as e:
+            if "EOF" in str(e) or "UNEXPECTED_EOF" in str(e):
+                raise _NoTLSThere()
+            self.sock.close()
+            raise WasabiError(
+                "the encrypted connection failed (%s) - the Amiga may "
+                "not trust this computer's certificate: 'wasabi keys "
+                "amiga' installs a matching set" % (e.reason or e))
+        except (ConnectionResetError, BrokenPipeError, EOFError):
+            raise _NoTLSThere()
+        except socket.timeout:
+            self.sock.close()
+            raise AmigaSilent("the Amiga did not finish the TLS "
+                              "handshake in %d s" % timeout)
+
+    def _hello(self, key, timeout):
+        self.send(HELLO, struct.pack(">H", VERSION) + pack_str(key))
+        try:
+            tag, payload = self.recv()
+        except socket.timeout:
+            raise AmigaSilent(
+                "the Amiga took the connection but its daemon did not "
+                "answer for %d s - frozen, or stuck on something"
+                % timeout)
+        if tag == ERR:
+            raise WasabiError(self._errtext(payload))
+        if tag != WELCOME:
+            raise WasabiError("unexpected reply to HELLO: tag 0x%02x" % tag)
+        (remote_version,) = struct.unpack_from(">H", payload, 0)
+        if remote_version != VERSION:
+            raise WasabiError(
+                "protocol mismatch: wasabid speaks v%d, this client speaks v%d"
+                % (remote_version, VERSION))
+        self.banner, off = unpack_str(payload, 2)
+        # Capabilities are appended after the banner. A daemon that
+        # predates them sends nothing more, and an empty set means
+        # "cannot tell" - never "supports nothing".
+        self.caps = set()
+        self.refused = None
+        if off < len(payload):
+            caps, off = unpack_str(payload, off)
+            self.caps = {c.strip() for c in caps.split(",") if c.strip()}
+        if off + 4 <= len(payload):
+            (self.refused,) = struct.unpack_from(">I", payload, off)
+
+    def send(self, tag, payload=b""):
+        if len(payload) > MAX_PAYLOAD:
+            raise WasabiError("frame too large: %d bytes" % len(payload))
+        self.sock.sendall(struct.pack(">BI", tag, len(payload)) + payload)
+
+    def _fill(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise WasabiError("connection closed by the Amiga")
+            self.buf += chunk
+
+    def recv(self):
+        self._fill(5)
+        tag, length = struct.unpack(">BI", self.buf[:5])
+        if length > MAX_PAYLOAD:
+            raise WasabiError("oversized frame from wasabid: %d bytes" % length)
+        self._fill(5 + length)
+        payload = self.buf[5:5 + length]
+        self.buf = self.buf[5 + length:]
+        return tag, payload
+
+    @staticmethod
+    def _errtext(payload):
+        try:
+            (code,) = struct.unpack_from(">I", payload, 0)
+            msg, _ = unpack_str(payload, 4)
+        except struct.error:
+            return "malformed error frame (%d byte(s))" % len(payload)
+        return "%s (%s)" % (msg, dos_error(code)) if code else msg
+
+    def expect_ok(self):
+        tag, payload = self.recv()
+        if tag == ERR:
+            raise WasabiError(self._errtext(payload))
+        if tag != OK:
+            raise WasabiError("expected OK, got tag 0x%02x" % tag)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --- TLS: the user's own small certificate authority --------------------
+
+def keys_dir():
+    return os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "wasabi",
+                        "keys")
+
+
+_TLS_CTX = None
+
+
+class _NoTLSThere(Exception):
+    """The Amiga closed the connection at the TLS handshake: it has no
+    encryption to offer."""
+
+
+def have_keys():
+    d = keys_dir()
+    return all(os.path.exists(os.path.join(d, n))
+               for n in ("ca.crt", "client.crt", "client.key"))
+
+
+# Amigas that were reached encrypted: from then on, plain to them is
+# refused (as SSH refuses a changed host key) - otherwise anything that
+# could answer in an Amiga's place could ask for plain and get the key.
+def _pins_path():
+    return os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "wasabi",
+                        "tls-hosts")
+
+
+def _pins():
+    try:
+        with open(_pins_path()) as f:
+            return {l.strip() for l in f if l.strip()}
+    except OSError:
+        return set()
+
+
+def tls_pinned(peer, port):
+    return "%s:%d" % (peer, port) in _pins()
+
+
+def tls_pin(peer, port):
+    entry = "%s:%d" % (peer, port)
+    if entry in _pins():
+        return
+    try:
+        os.makedirs(os.path.dirname(_pins_path()), exist_ok=True)
+        with open(_pins_path(), "a") as f:
+            f.write(entry + "\n")
+    except OSError:
+        pass                            # a read-only config: no memory
+
+
+def tls_forget(host):
+    keep = [p for p in _pins() if p != host and not p.startswith(host + ":")]
+    gone = len(_pins()) - len(keep)
+    with open(_pins_path(), "w") as f:
+        f.write("".join(p + "\n" for p in sorted(keep)))
+    return gone
+
+
+_WARNED = set()
+
+
+def plain_warning(peer):
+    if peer not in _WARNED:
+        _WARNED.add(peer)
+        print("wasabi: %s has no encryption (no AmiSSL or keys there) - "
+              "this connection is plain" % peer, file=sys.stderr)
+
+
+def tls_context():
+    """TLS 1.3 to the Amiga: it must show a certificate signed by this
+    user's Wasabi CA, and we show ours (also signed by it). Made once
+    by `wasabi keys init`."""
+    global _TLS_CTX
+    if _TLS_CTX:
+        return _TLS_CTX
+    d = keys_dir()
+    need = [os.path.join(d, n) for n in ("ca.crt", "client.crt",
+                                         "client.key")]
+    missing = [n for n in need if not os.path.exists(n)]
+    if missing:
+        raise WasabiError(
+            "no Wasabi keys in %s - every connection is encrypted now; "
+            "make them once with 'wasabi keys init' (or copy that folder "
+            "from the computer that has them)" % d)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.check_hostname = False          # the CA's signature is the name
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(need[0])
+    ctx.load_cert_chain(need[1], need[2])
+    _TLS_CTX = ctx
+    return ctx
+
+
+_OPENSSL = None
+
+
+def openssl_bin():
+    """An OpenSSL 3 command. macOS's own `openssl` is LibreSSL, which
+    cannot make Ed25519 keys; Homebrew's openssl@3 is the usual cure."""
+    global _OPENSSL
+    if _OPENSSL:
+        return _OPENSSL
+    import shutil
+    for c in [shutil.which("openssl"),
+              "/opt/homebrew/opt/openssl@3/bin/openssl",
+              "/usr/local/opt/openssl@3/bin/openssl"]:
+        if not c or not os.path.exists(c):
+            continue
+        try:
+            v = subprocess.run([c, "version"], capture_output=True,
+                               text=True).stdout
+        except OSError:
+            continue
+        if v.startswith("OpenSSL ") and not v.startswith(("OpenSSL 0",
+                                                          "OpenSSL 1")):
+            _OPENSSL = c
+            return c
+    raise WasabiError("making keys needs OpenSSL 3 (the 'openssl' command; "
+                      "on a Mac: brew install openssl@3)")
+
+
+def _openssl(*args, stdin=None):
+    p = subprocess.run([openssl_bin()] + list(args), input=stdin,
+                       capture_output=True)
+    if p.returncode != 0:
+        raise WasabiError("openssl %s failed: %s"
+                          % (args[0], p.stderr.decode(errors="replace")
+                             .strip()[-300:]))
+    return p.stdout
+
+
+def _private_write(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+DAYS = "36500"      # the Amiga does not check dates; the PC should not fail
+# Ed25519: on a 68030/50 a handshake took 22 s with P-256 and 12 s with
+# Ed25519 (with X25519 key exchange) - every public-key step is plain
+# 68k arithmetic.
+
+
+def make_leaf(name, cn, usage):
+    """A key and a certificate signed by the CA: name.key, name.crt."""
+    d = keys_dir()
+    key, crt = os.path.join(d, name + ".key"), os.path.join(d, name + ".crt")
+    csr = os.path.join(d, name + ".csr")
+    ext = os.path.join(d, name + ".ext")
+    with open(ext, "w") as f:
+        f.write("basicConstraints=critical,CA:FALSE\n"
+                "keyUsage=critical,digitalSignature\n"
+                "extendedKeyUsage=%s\n"
+                "subjectKeyIdentifier=hash\n"
+                "authorityKeyIdentifier=keyid\n" % usage)
+    try:
+        _openssl("req", "-new", "-newkey", "ed25519", "-nodes",
+                 "-keyout", key,
+                 "-out", csr, "-subj", "/CN=" + cn)
+        os.chmod(key, 0o600)
+        _openssl("x509", "-req", "-in", csr, "-CA",
+                 os.path.join(d, "ca.crt"), "-CAkey",
+                 os.path.join(d, "ca.key"), "-set_serial",
+                 str(random.getrandbits(63)), "-days", DAYS,
+                 "-extfile", ext, "-out", crt)
+    finally:
+        for f in (csr, ext):
+            if os.path.exists(f):
+                os.remove(f)
+    return key, crt
+
+
+def keys_init(quiet=False):
+    d = keys_dir()
+    if os.path.exists(os.path.join(d, "ca.key")):
+        raise WasabiError("keys exist already in %s - keep them; making new "
+                          "ones would lock out every Amiga that has the old "
+                          "set" % d)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    # A certificate's name holds 64 characters; a Mac in the cloud is
+    # called "sat12-bq155-2006...-A67B0C05C82A.local".
+    host = socket.gethostname().split(".")[0][:32]
+    try:
+        _keys_make_ca(d, host)
+    except BaseException:
+        for n in ("ca.key", "ca.crt", "client.key", "client.crt"):
+            if os.path.exists(os.path.join(d, n)):
+                os.remove(os.path.join(d, n))  # no half set to trip on
+        raise
+    if not quiet:
+        print("made a Wasabi CA and this computer's certificate in %s" % d)
+        print("next: 'wasabi --plain keys amiga NAME' for each Amiga still "
+              "on an old wasabid, or 'wasabi keys drive DIR NAME' for an "
+              "emulator's drive")
+
+
+def _keys_make_ca(d, host):
+    _openssl("req", "-x509", "-new", "-newkey", "ed25519", "-nodes",
+             "-keyout", os.path.join(d, "ca.key"),
+             "-out", os.path.join(d, "ca.crt"), "-days", DAYS,
+             "-subj", "/CN=Wasabi CA (%s)" % host,
+             "-addext", "basicConstraints=critical,CA:TRUE",
+             "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    os.chmod(os.path.join(d, "ca.key"), 0o600)
+    make_leaf("client", "Wasabi client (%s)" % host, "clientAuth")
+
+
+def amiga_set(name):
+    """The three files an Amiga needs, making its certificate if new."""
+    d = keys_dir()
+    if not os.path.exists(os.path.join(d, "ca.key")):
+        raise WasabiError("no Wasabi CA yet - 'wasabi keys init' first")
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    key = os.path.join(d, "amiga-%s.key" % safe)
+    crt = os.path.join(d, "amiga-%s.crt" % safe)
+    if not (os.path.exists(key) and os.path.exists(crt)):
+        key, crt = make_leaf("amiga-" + safe, "Wasabi Amiga %s" % name[:40],
+                             "serverAuth")
+    read = lambda p: open(p, "rb").read()
+    return {"ca.crt": read(os.path.join(d, "ca.crt")),
+            "amiga.crt": read(crt), "amiga.key": read(key)}
+
+
+def cmd_keys(args):
+    """wasabi keys init | amiga NAME | drive DIR NAME | show"""
+    if args.action == "init":
+        return keys_init()
+    if args.action == "show":
+        d = keys_dir()
+        if not os.path.isdir(d):
+            print("no keys yet - 'wasabi keys init'")
+            return 1
+        for n in sorted(os.listdir(d)):
+            if n.endswith(".crt"):
+                subj = _openssl("x509", "-noout", "-subject", "-fingerprint",
+                                "-sha256", "-in", os.path.join(d, n))
+                print("%-24s %s" % (n, " ".join(subj.decode().split())))
+        for p in sorted(_pins()):
+            print("%-24s reached encrypted: plain is refused" % p)
+        return 0
+    if args.action == "forget":
+        if not args.where:
+            raise WasabiError("wasabi keys forget HOST - the address as "
+                              "'keys show' lists it")
+        n = tls_forget(args.where)
+        print("forgot %d encrypted Amiga(s) at %s" % (n, args.where))
+        return 0
+    if args.action == "drive":
+        if not args.where or not args.name:
+            raise WasabiError("wasabi keys drive DIR NAME - DIR is the "
+                              "emulator drive's folder (it has Prefs/)")
+        dst = os.path.join(args.where, "Prefs", "Env-Archive", "wasabi")
+        if not os.path.isdir(os.path.join(args.where, "Prefs")):
+            raise WasabiError("%s has no Prefs/ - not a system drive"
+                              % args.where)
+        os.makedirs(dst, exist_ok=True)
+        for n, data in amiga_set(args.name).items():
+            (_private_write if n.endswith(".key") else
+             lambda p, b: open(p, "wb").write(b))(os.path.join(dst, n), data)
+        print("keys for %s in %s" % (args.name, dst))
+        return 0
+    raise WasabiError("unknown keys action")
+
+
+def keys_amiga(conn, args):
+    """Install an Amiga's keys over the connection (old daemon: --plain)."""
+    name = args.where or args.name
+    if not name:
+        raise WasabiError("wasabi keys amiga NAME (its discovery name, e.g. "
+                          "a1200)")
+    files = amiga_set(name)
+    conn.send(MKDIR, pack_str("ENVARC:wasabi"))
+    try:
+        conn.expect_ok()
+    except WasabiError:
+        pass                            # it exists
+    for n, data in files.items():
+        put_bytes(conn, data, "ENVARC:wasabi/" + n)
+    print("keys for %s installed in ENVARC:wasabi/ on %s"
+          % (name, conn.host))
+
+
+# --- helpers ----------------------------------------------------------
+
+
+def amiga_date(days, mins, ticks):
+    ts = AMIGA_EPOCH + days * 86400 + mins * 60 + ticks // 50
+    # A DateStamp is the Amiga's local wall time already, so render it
+    # verbatim: gmtime() applies no offset. localtime() here shifted every
+    # timestamp by this box's UTC offset - the mock hid it, because the
+    # mock derives stamps from st_mtime, for which localtime IS right.
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts))
+
+
+def protstr(bits):
+    """Render AmigaDOS protection bits the way List does: hsparwed."""
+    out = []
+    for i, ch in enumerate("hsparwed"):
+        if i < 4:  # h s p a - active high
+            out.append(ch if bits & (1 << (7 - i)) else "-")
+        else:      # r w e d - active LOW
+            out.append("-" if bits & (1 << (7 - i)) else ch)
+    return "".join(out)
+
+
+def amiga_pattern(pat):
+    """AmigaDOS wildcards -> anchored regex: '#?' and '*' are any-run,
+    '?' any single char, case-insensitive, whole-name match."""
+    out, i = [], 0
+    while i < len(pat):
+        if pat[i:i + 2] == "#?" or pat[i] == "*":
+            out.append(".*")
+            i += 2 if pat[i] == "#" else 1
+        elif pat[i] == "?":
+            out.append(".")
+            i += 1
+        else:
+            out.append(re.escape(pat[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z", re.I)
+
+
+def drain_to_end(conn, sink):
+    """Collect DATA frames until END. Returns on END, raises on ERR."""
+    while True:
+        tag, payload = conn.recv()
+        if tag == DATA:
+            sink(payload)
+        elif tag == END:
+            return
+        elif tag == ERR:
+            raise WasabiError(conn._errtext(payload))
+        else:
+            raise WasabiError("unexpected tag 0x%02x in data stream" % tag)
+
+
+# --- commands ---------------------------------------------------------
+
+
+def cmd_ping(conn, args):
+    t0 = time.time()
+    conn.send(PING)
+    tag, _ = conn.recv()
+    if tag != PONG:
+        raise WasabiError("no PONG")
+    ms = (time.time() - t0) * 1000
+    if args.json:
+        emit_json({"banner": conn.banner, "ms": round(ms, 1),
+                   "caps": sorted(conn.caps)})
+        return
+    print("%s - %.1f ms" % (conn.banner, ms))
+
+
+def cmd_info(conn, args):
+    conn.send(INFO)
+    drain_to_end(conn, lambda b: sys.stdout.write(b.decode("latin-1")))
+    if conn.caps:
+        print("can: %s" % " ".join(sorted(conn.caps)))
+    else:
+        print("can: (this wasabid predates the capability list)")
+    if conn.refused is not None:
+        print("refused: %d connection(s) from off the LAN" % conn.refused)
+
+
+def ls_entries(conn, path):
+    """(kind 'd'/'f', size, protection bits, date text, name) for each
+    entry in PATH, drawers first, then by name."""
+    conn.send(LS, pack_str(path))
+    text = []
+    drain_to_end(conn, lambda b: text.append(b))
+    entries = []
+    for line in b"".join(text).decode("latin-1").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split(" ", 6)
+        if len(parts) < 7:
+            continue
+        kind, size, bits, days, mins, ticks, name = parts
+        entries.append((kind, int(size), int(bits), amiga_date(
+            int(days), int(mins), int(ticks)), name))
+    entries.sort(key=lambda e: (e[0] != "d", e[4].lower()))
+    return entries
+
+
+def cmd_ls(conn, args):
+    entries = ls_entries(conn, args.path)
+    if args.json:
+        emit_json([{"name": name, "dir": kind == "d",
+                    "size": None if kind == "d" else size,
+                    "protection": protstr(bits), "date": when}
+                   for kind, size, bits, when, name in entries])
+        return
+    for kind, size, bits, when, name in entries:
+        print("%s %8s %s  %s  %s" % (
+            "d" if kind == "d" else "-",
+            "(dir)" if kind == "d" else size,
+            protstr(bits), when, name))
+    sys.stdout.flush()
+    print("%d entries in %s" % (len(entries), args.path or "the root"),
+          file=sys.stderr)
+
+
+def cmd_put(conn, args):
+    check_system_place(args, args.remote, "write")
+    do_put(conn, args.local, args.remote, quiet=args.quiet)
+
+
+# The PUT header carries the size as a u32, and the daemon counts what
+# arrives in a ULONG, so this is the wire's ceiling and not an arbitrary
+# one. Bigger than this needs a protocol change, not a bigger buffer.
+MAX_FILE = 0xFFFFFFFF
+
+
+def _put_header(conn, size, remote, prot=PROT_DEFAULT):
+    if size > MAX_FILE:
+        raise WasabiError(
+            "%s is %d bytes; the protocol carries the size in 32 bits, so "
+            "%d is the most it can send" % (remote, size, MAX_FILE))
+    conn.send(PUT, struct.pack(">II", size, prot) + pack_str(remote))
+
+
+def put_bytes(conn, data, remote, prot=PROT_DEFAULT):
+    """Upload something already in memory. `prot`: protection bits to
+    set (the default leaves the daemon's own - a fresh file's)."""
+    _put_header(conn, len(data), remote, prot)
+    for i in range(0, len(data), MAX_PAYLOAD):
+        conn.send(DATA, data[i:i + MAX_PAYLOAD])
+    conn.send(END)
+    conn.expect_ok()
+
+
+def do_put(conn, local, remote, quiet=False):
+    """Upload a file, a chunk at a time.
+
+    Read straight from disk into each frame rather than loading the file
+    first: a deploy should cost the same memory whether it is a 30 KB
+    handler or a 4 GB disk image, and the client should not need more
+    RAM than the thing it is sending.
+    """
+    size = os.path.getsize(local)
+    _put_header(conn, size, remote)
+    sent = 0
+    with open(local, "rb") as fh:
+        while sent < size:
+            chunk = fh.read(min(MAX_PAYLOAD, size - sent))
+            if not chunk:
+                raise WasabiError("%s shrank while it was being sent" % local)
+            conn.send(DATA, chunk)
+            sent += len(chunk)
+    conn.send(END)
+    conn.expect_ok()
+    if not quiet:
+        print("%s -> %s (%d bytes)" % (local, remote, size), file=sys.stderr)
+
+
+def cmd_get(conn, args):
+    conn.send(GET, pack_str(args.remote))
+    out = open(args.local, "wb") if args.local != "-" else sys.stdout.buffer
+    total = [0]
+
+    def sink(b):
+        out.write(b)
+        total[0] += len(b)
+
+    try:
+        drain_to_end(conn, sink)
+    finally:
+        if out is not sys.stdout.buffer:
+            out.close()
+    if args.local != "-":
+        print("%s -> %s (%d bytes)" % (args.remote, args.local, total[0]),
+              file=sys.stderr)
+
+
+def cmd_run(conn, args):
+    if args.detach and conn.caps and "detach" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot start a command without waiting - "
+            "update it with 'wasabi update wasabid', or type: "
+            "wasabi run \"Run >NIL: %s\"" % (conn.banner, args.command))
+    out = [] if args.json else None
+    try:
+        rc = do_run(conn, args.command, merge=args.merge,
+                    detach=args.detach, sink=out.append if args.json
+                    else None, max_time=args.max_time)
+    except TimeLimit as exc:
+        if args.json:
+            emit_json({"rc": None, "output": "".join(out),
+                       "error": str(exc)})
+        raise
+    if args.json:
+        emit_json({"rc": rc, "output": "".join(out)})
+    return rc
+
+
+# How long `run` lets a command say nothing before it checks, on a
+# second connection, that the daemon is still alive. A quiet command
+# is normal (a compile, a Wait); a quiet *machine* is not.
+RUN_CHECK = float(os.environ.get("WASABI_RUN_CHECK", 10.0))
+
+
+def command_word(command, path=False):
+    """The command's first word: 'C:Wait 5' -> 'Wait', or 'C:Wait' with
+    path=True - which is what the daemon's KILL matches, because a
+    Shell's cli_CommandName is the command as it was typed."""
+    command = command.strip()
+    if command.startswith('"'):
+        word = command[1:].split('"', 1)[0]
+    else:
+        word = command.split(" ", 1)[0]
+    return word if path else re.split(r"[:/]", word)[-1]
+
+
+def readable(sock):
+    """Something (data or a close) is waiting on this socket now."""
+    try:
+        if isinstance(sock, ssl.SSLSocket) and sock.pending():
+            return True                 # decrypted already: select won't say
+        return bool(select.select([sock], [], [], 0)[0])
+    except (OSError, ValueError):
+        return False
+
+
+def still_answering(conn):
+    """Ping the daemon on a side connection. TRUE if it answers."""
+    try:
+        side = Conn(conn.host, conn.port, conn.key, timeout=SILENCE)
+    except (OSError, WasabiError):
+        return False
+    try:
+        side.send(PING)
+        tag, _ = side.recv()
+        return tag == PONG
+    except (OSError, WasabiError):
+        return False
+    finally:
+        side.close()
+
+
+def stop_command(conn, command, slot=None):
+    """Ctrl-C the running command, on a side connection - the main one
+    is busy carrying its output. By its slot when the daemon said which
+    (exactly this command, even if another slot runs the same one), else
+    by name."""
+    try:
+        side = Conn(conn.host, conn.port, conn.key, timeout=SILENCE)
+        try:
+            if slot:
+                side.send(FREE, struct.pack(">II", slot, FREE_BREAK_ONLY))
+                drain_to_end(side, lambda b: None)
+            else:
+                side.send(KILL, struct.pack(">I", 0) +
+                          pack_str(command_word(command, path=True)))
+                side.expect_ok()
+        finally:
+            side.close()
+        return True
+    except (OSError, WasabiError):
+        return False
+
+
+def do_run(conn, command, merge=False, detach=False, sink=None,
+           max_time=None, err_sink=None):
+    # The daemon holds a command in a 512-byte buffer and strncpy would
+    # truncate silently - running half a command is worse than refusing.
+    nbytes = len(command.encode("latin-1", "replace"))
+    if nbytes > 511:
+        raise WasabiError(
+            "that command is %d bytes and wasabid holds 511 - put it in a "
+            "script, upload it, and run that instead" % nbytes)
+    flags = (1 if merge else 0) | (2 if detach else 0)
+    if not detach and "slots" in conn.caps:
+        flags |= RUN_SLOT
+    conn.send(RUN, struct.pack(">I", flags) + pack_str(command))
+    # A command may legitimately think for a long time before it says
+    # anything - a compile, or just loading a 760 KB binary off disk -
+    # so silence alone proves nothing. Every RUN_CHECK seconds of it,
+    # a side connection pings the daemon: an answer means the command
+    # is merely quiet, no answer means the Amiga has stopped. Without
+    # this a frozen machine held `run` forever: no FIN ever comes, and
+    # keepalive only proves the network stack is alive.
+    old_timeout = conn.sock.gettimeout()
+    deadline = time.time() + max_time if max_time else None
+    try:
+        return _run_loop(conn, sink, command, deadline, max_time,
+                         err_sink or sink)
+    finally:
+        conn.sock.settimeout(old_timeout)
+
+
+def _run_loop(conn, sink, command, deadline, max_time, err_sink=None):
+    stopping = None                     # when the Ctrl-C went out
+    slot = None                         # which run slot, if the daemon says
+    while True:
+        wait = RUN_CHECK
+        if deadline is not None:
+            wait = max(0.05, min(wait, deadline - time.time()))
+        conn.sock.settimeout(wait)
+        try:
+            tag, payload = conn.recv()
+        except socket.timeout:
+            now = time.time()
+            if deadline is not None and now >= deadline:
+                if stopping is None:
+                    # Time is up: Ctrl-C it, then give it a grace period
+                    # to wind down and report its exit like any other.
+                    sent = stop_command(conn, command, slot)
+                    stopping = now
+                    deadline = now + 10.0
+                    if not sent:
+                        raise TimeLimit(
+                            "%s is still running after %g s, and the "
+                            "Ctrl-C could not be sent - it keeps running "
+                            "on the Amiga" % (command_word(command),
+                                              max_time))
+                    continue
+                if slot:
+                    raise TimeLimit(
+                        "%s is still running after %g s and ignored "
+                        "Ctrl-C - it keeps running in slot %d. 'wasabi "
+                        "free %d' lets go of the slot"
+                        % (command_word(command), max_time, slot, slot))
+                raise TimeLimit(
+                    "%s is still running after %g s and ignored Ctrl-C - "
+                    "it keeps running on the Amiga, and the next 'run' "
+                    "waits until it ends. 'wasabi kill --force %s' "
+                    "removes it" % (command_word(command), max_time,
+                                    command_word(command)))
+            # The ping can wait out a daemon that was busy (a forced
+            # restart grants ten seconds of grace) while the answer we
+            # were waiting for arrived here meanwhile: read that first.
+            if not still_answering(conn) and not readable(conn.sock):
+                raise AmigaSilent(
+                    "the Amiga stopped answering while %s was running "
+                    "(nothing for %d s, and a ping got no reply)"
+                    % (command_word(command), RUN_CHECK + SILENCE))
+            continue
+        if tag == SLOT and len(payload) == 4:
+            (slot,) = struct.unpack(">I", payload)
+            continue
+        if tag == STDOUT:
+            if sink is not None:
+                sink(payload.decode("latin-1"))
+            else:
+                sys.stdout.write(payload.decode("latin-1"))
+                sys.stdout.flush()
+        elif tag == STDERR:
+            if err_sink is not None:
+                err_sink(payload.decode("latin-1"))
+            else:
+                sys.stderr.write(payload.decode("latin-1"))
+                sys.stderr.flush()
+        elif tag == EXIT:
+            rc, secondary = struct.unpack(">II", payload)
+            if stopping is not None:
+                raise TimeLimit("%s ran past %g s and was stopped with "
+                                "Ctrl-C (it returned %d)"
+                                % (command_word(command), max_time, rc))
+            return rc
+        elif tag == ERR:
+            raise WasabiError(conn._errtext(payload))
+        else:
+            raise WasabiError("unexpected tag 0x%02x during RUN" % tag)
+
+
+VER_TAG = b"$VER: wasabid "
+
+
+def local_wasabid_version(path):
+    """Read the '$VER: wasabid ...' tag out of a binary without running it.
+
+    Returns 'wasabid 0.1b14' - name and version only. The full tag
+    carries a date that AmigaDOS's Version command reformats when it
+    prints it, so only the first two words can be compared.
+    """
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    i = blob.find(VER_TAG)
+    if i < 0:
+        return None
+    end = blob.find(b"\0", i)
+    tag = blob[i + 6:end if end > 0 else i + 120].decode("latin-1", "replace")
+    return " ".join(tag.split()[:2])
+
+
+def cmd_update(conn, args):
+    """Replace the running daemon, but only after proving the new one works.
+
+    Once the old daemon exits to relaunch there is nothing left running
+    that could undo a bad install, so every check happens while the old
+    one is still alive and in charge. Four of them, cheapest first, each
+    catching what the one before it cannot:
+
+      1. the local file carries a '$VER: wasabid' tag at all;
+      2. the uploaded copy identifies as that same version, read out of
+         the file by AmigaDOS - nothing is executed yet;
+      3. it runs, and echoes back a nonce only wasabid knows to print -
+         exit status alone proves nothing, since C:Echo exits 0 too;
+      4. it comes up as a real daemon on a spare port and serves a
+         handshake and a ping, which is the actual job.
+
+    Only then is it installed - by renaming the verified sidecar into
+    place, so the bytes that passed are the bytes that run.
+    """
+    ident = local_wasabid_version(args.local)
+    if not ident:
+        raise WasabiError(
+            "%s carries no '$VER: wasabid' tag, so it is not a wasabid "
+            "binary - refusing to install it as the daemon" % args.local)
+
+    sidecar = args.sidecar
+    testport = args.testport or (args.port + 1)
+    print("updating to %s" % ident, file=sys.stderr)
+    do_put(conn, args.local, sidecar)
+
+    def abort(why, stop_probe=False):
+        if stop_probe:
+            why += ("; a test instance may still be on port %d - "
+                    "find it with 'wasabi ps' and stop it with 'wasabi kill'"
+                    % testport)
+        try:
+            conn.send(DEL, pack_str(sidecar))
+            conn.expect_ok()
+        except WasabiError:
+            pass
+        raise WasabiError("%s. The running daemon is untouched" % why)
+
+    out = []
+    rc = do_run(conn, 'Version "%s" FULL' % sidecar, sink=out.append)
+    _lines = "".join(out).strip().splitlines()
+    seen = _lines[0] if _lines else ""
+    if rc != 0 or ident not in seen:
+        abort("the uploaded file does not identify as %s (Version said %r)"
+              % (ident, seen))
+    print("  identity   %s" % seen, file=sys.stderr)
+
+    nonce = "%08x" % random.getrandbits(32)
+    out = []
+    rc = do_run(conn, "%s --selftest %s" % (sidecar, nonce), sink=out.append)
+    if rc != 0 or ("wasabid-selftest-ok %s" % nonce) not in "".join(out):
+        abort("it did not pass its own self-test (rc %d, said %r)"
+              % (rc, "".join(out).strip()))
+    print("  selftest   ok", file=sys.stderr)
+
+    # The trial daemon answers RFC1918 + loopback by default. If this
+    # client reaches the Amiga from outside those ranges (an unmasqueraded
+    # VPN, say), the running daemon was started with an allow for us - the
+    # trial instance needs one too, or the live probe below is refused by
+    # the very binary it is vouching for. Redundant on a plain LAN, and
+    # harmless: /32 admits exactly this client.
+    #
+    # --no-trial skips this whole stage. It is the only part of an update
+    # that runs a SECOND daemon beside the live one - two processes
+    # patching the same exec vectors, one of which then unloads - which
+    # is the situation that reliably takes this machine down. The
+    # identity and self-test checks above still run, so what gets
+    # installed is still a binary that named itself correctly and passed
+    # its own tests; only the live-on-a-spare-port proof is given up.
+    if args.no_trial:
+        print("  live       skipped (--no-trial)", file=sys.stderr)
+        conn.send(INSTALL, pack_str(sidecar))
+        conn.expect_ok()
+        do_restart(conn)
+        print("installed - the daemon is reloading itself", file=sys.stderr)
+        return 0
+
+    myip = conn.sock.getsockname()[0]
+    # 'trial' tells the new binary to patch nothing and claim nothing:
+    # it is about to be unloaded, and a jump table pointing into a freed
+    # segment gurus the machine with a privilege violation later on.
+    # A binary too old to know the word ignores it and is no worse off
+    # than it was before.
+    do_run(conn, "Run >NIL: %s %d trial allow %s/32"
+                 % (sidecar, testport, myip))
+    time.sleep(2.0)
+    try:
+        # The new build is proven the way this connection works:
+        # encrypted if this one is.
+        probe = Conn(conn.host, testport, args.key, timeout=20.0,
+                     tls=conn.tls)
+    except (OSError, WasabiError) as exc:
+        abort("it did not come up as a daemon on port %d (%s)"
+              % (testport, exc), stop_probe=True)
+    try:
+        banner = probe.banner
+        if ident not in banner:
+            abort("the instance on port %d called itself %r, not %s"
+                  % (testport, banner, ident), stop_probe=True)
+        probe.send(PING)
+        if probe.recv()[0] != PONG:
+            abort("the instance on port %d did not answer a ping" % testport,
+                  stop_probe=True)
+        print("  live       %s served a handshake and a ping on port %d"
+              % (banner, testport), file=sys.stderr)
+    finally:
+        try:
+            probe.send(QUIT)
+            probe.expect_ok()
+        except (OSError, WasabiError):
+            pass
+        probe.close()
+
+    conn.send(INSTALL, pack_str(sidecar))
+    conn.expect_ok()
+    do_restart(conn)
+    print("installed - the daemon is reloading itself", file=sys.stderr)
+    return 0
+
+
+def cmd_quit(conn, args):
+    if not args.yes:
+        raise WasabiError(
+            "this stops the daemon and nothing restarts it - you would need "
+            "physical access to the Amiga. Pass --yes if you mean it")
+    conn.send(QUIT, struct.pack(">I", 1 if args.force else 0))
+    try:
+        conn.expect_ok()
+    except WasabiError as exc:
+        # The daemon exits right after acking, so a dead connection here
+        # is success - but a refusal (a command still running) is not.
+        if "connection closed" not in str(exc):
+            raise
+    print("the daemon has stopped", file=sys.stderr)
+
+
+def cmd_deploy(conn, args):
+    check_system_place(args, args.remote, "write")
+    do_put(conn, args.local, args.remote, quiet=False)
+    rc = 0
+    if args.run:
+        rc = do_run(conn, args.run)
+    if args.reboot:
+        print("rebooting the Amiga...", file=sys.stderr)
+        do_reboot(conn, cold=args.cold)
+    elif args.restart:
+        do_restart(conn)
+        print("the daemon is reloading itself", file=sys.stderr)
+    return rc
+
+
+class StreamStop(Exception):
+    """--for ran out, or --until saw its text: end the stream cleanly."""
+    def __init__(self, code, why):
+        Exception.__init__(self, why)
+        self.code, self.why = code, why
+
+
+def cmd_stream(conn, args):
+    """Follow the daemon's debug and/or snoop stream.
+
+    Both subscriptions ride one connection - the daemon tags every LOG
+    frame with its stream and numbers each stream independently. In the
+    combined view every line is prefixed with its stream name; --log
+    appends each line to a file stamped with the client's receive time,
+    so logs from parallel terminals line up.
+
+    The stream does not give up. A lost connection - keepalive giving
+    up on a frozen machine, a reboot's reset, a flaky Wi-Fi hop, the
+    daemon restarting - is announced and then retried forever, and the
+    daemon reports the previous guru to its first subscriber, so the
+    terminal that watched a machine die also greets it coming back and
+    says why it died. --once restores the old stop-on-disconnect.
+    """
+    want_debug = args.mode == "debug"
+    want_snoop = args.mode == "snoop" or getattr(args, "with_snoop", False)
+    combined = want_debug and want_snoop
+    label = "+".join(n for n, w in (("debug", want_debug),
+                                    ("snoop", want_snoop)) if w)
+
+    if want_snoop and conn.caps and "snoop" not in conn.caps:
+        print("wasabi: this daemon (%s) has no 'snoop' - update it with "
+              "'wasabi update wasabid'" % conn.banner, file=sys.stderr)
+        return 2
+    entry = getattr(args, "entry", False)
+    # Both of these steer the snoop trace, and there is no snoop trace in
+    # a plain `debug`. Silently ignoring them would be worse than
+    # refusing: the opening line would announce entry logging that is not
+    # happening, and the operator would trust it.
+    if not want_snoop:
+        unused = [n for n, v in (("--entry", entry),
+                                 ("--task", getattr(args, "task", ""))) if v]
+        if unused:
+            print("wasabi: %s only affect%s the snoop trace - add "
+                  "--with-snoop, or use the snoop command"
+                  % (" and ".join(unused), "" if len(unused) > 1 else "s"),
+                  file=sys.stderr)
+            return 2
+    if entry and conn.caps and "snoopentry" not in conn.caps:
+        print("wasabi: this daemon (%s) has no entry logging - update it "
+              "with 'wasabi update wasabid'" % conn.banner, file=sys.stderr)
+        return 2
+
+    def subscribe(c):
+        if want_debug:
+            c.send(DEBUG, struct.pack(">I", 0))
+        if want_snoop:
+            c.send(SNOOP, struct.pack(">I", SNOOPF_ENTRY if entry else 0)
+                   + pack_str(args.task or ""))
+
+    subscribe(conn)
+
+    logf = open(args.log, "a") if args.log else None
+    until = (getattr(args, "until", None) or "").lower()
+    names = {0: "debug", 1: "snoop"}
+    partial = {}
+    mode = getattr(args, "output", "normal")
+    hide_self = getattr(args, "ignore_wasabi", False)
+    last_line = {}                       # per stream, for folding repeats
+    repeats = {}
+
+    def stamp():
+        now = time.time()
+        return (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) +
+                ".%03d" % int(now % 1 * 1000))
+
+    def write_line(stream, out, to_stdout=True):
+        name = names.get(stream, "stream%d" % stream)
+        if to_stdout:
+            sys.stdout.write(("%s | %s\n" % (name, out)) if combined
+                             else out + "\n")
+        if logf:
+            logf.write("%s %s | %s\n" % (stamp(), name, out))
+
+    def flush_repeats(stream=None):
+        """Emit the tally for a run of identical lines. Called when the
+        run ends - and also when the stream falls quiet or drops, so a
+        freeze cannot swallow the count of what it was doing."""
+        for st in ([stream] if stream is not None else list(repeats)):
+            n = repeats.pop(st, 0)
+            if n:
+                write_line(st, "  ... %d more identical" % n)
+        sys.stdout.flush()
+        if logf:
+            logf.flush()
+
+    def emit(stream, text):
+        # The debug stream is raw bytes and can break mid-line, so both
+        # the prefixed view and the log assemble whole lines per stream.
+        # --output full keeps the plain single-stream view passing bytes
+        # straight through: a partial line may be the last thing a dying
+        # machine ever says, and nothing should hold it back. Folding
+        # repeats needs whole lines, so it implies assembling them.
+        # Hiding anything means looking at whole lines, so --ignore-wasabi
+        # gives up the raw byte passthrough that --output full otherwise
+        # keeps. A filter that silently does nothing in one mode is worse
+        # than no filter.
+        raw = (not combined) and mode == "full" and not hide_self
+        if raw:
+            sys.stdout.write(dress_errors(text))
+        buf = partial.get(stream, "") + text
+        lines = buf.split("\n")
+        partial[stream] = lines.pop()
+        for ln in lines:
+            out = dress_errors(ln)
+            if (mode == "minimal" and stream == 1 and out.strip()
+                    and NOISE_RE.search(out)):
+                continue                 # snoop only: the debug stream is
+                                         # the machine's own voice, and a
+                                         # driver printing "FindTask(" is
+                                         # not poll noise
+            if hide_self and out.strip() and WASABI_SELF_RE.search(out):
+                continue
+            hit = until and until in out.lower()
+            if mode != "full":
+                if out == last_line.get(stream):
+                    repeats[stream] = repeats.get(stream, 0) + 1
+                    continue
+                flush_repeats(stream)
+                last_line[stream] = out
+            write_line(stream, out, to_stdout=not raw)
+            if hit:
+                raise StreamStop(0, "'%s' seen" % args.until)
+        sys.stdout.flush()
+        if logf:
+            logf.flush()
+
+    def status(text):
+        flush_repeats()
+        # Client-side events go to stderr AND the log, as 'client |'
+        # lines: a log must say for itself what was subscribed, when
+        # the connection came and went, and why it ended - a reader
+        # (human or otherwise) should never have to assume.
+        print("[%s]" % text, file=sys.stderr)
+        if logf:
+            logf.write("%s client | %s\n" % (stamp(), text))
+            logf.flush()
+
+    def follow(c):
+        """Pump one connection until it dies; return why it did.
+
+        A daemon with the 'hb' capability sends an invisible empty LOG
+        on each subscribed stream every ~5 s, precisely so the silence
+        timer can exist: silence now means something. Missing one is a
+        warning, not an exit - the daemon is single-threaded, and a big
+        put in another terminal starves heartbeats for as long as it
+        runs. TCP keepalive (set in Conn) is what finally declares a
+        dead machine dead.
+        """
+        heartbeat = "hb" in c.caps
+        c.sock.settimeout(20.0 if heartbeat else None)
+        last_seq = {}                    # per connection: the daemon's
+        silent = 0                       # counters restart with it
+        while True:
+            try:
+                tag, payload = c.recv()
+            except socket.timeout:
+                silent += 1
+                if silent == 1:
+                    status("%s: nothing heard for 20 s - the machine is "
+                           "frozen, rebooted, or busy with something long"
+                           % label)
+                continue
+            except WasabiError as exc:
+                # EOF: the daemon closed the socket properly. Its last
+                # visible line said why (rebooting/restarting/stopping).
+                return str(exc)
+            except OSError as exc:
+                # Keepalive gave up on a frozen machine, a reboot's
+                # reset, a route that went away: none of these are a
+                # reason to stop watching.
+                return exc.strerror or str(exc) or type(exc).__name__
+            if silent:
+                status("%s: the stream is back" % label)
+                silent = 0
+            if tag == LOG:
+                stream, seq = struct.unpack_from(">II", payload, 0)
+                text, _ = unpack_str(payload, 8)
+                prev = last_seq.get(stream)
+                if prev is not None and seq != prev + 1:
+                    status("%s: %d frame(s) lost"
+                           % (names.get(stream, stream), seq - prev - 1))
+                last_seq[stream] = seq
+                emit(stream, text)
+            elif tag == ERR:
+                status("%s: the daemon refused: %s"
+                       % (label, c._errtext(payload)))
+                raise WasabiError(c._errtext(payload))
+
+    host, port, key = conn.host, conn.port, conn.key
+    opts = ""
+    if want_snoop and args.task:
+        opts += ", task filter '%s'" % args.task
+    if entry:
+        opts += ", entry logging"
+    if hide_self:
+        opts += ", wasabi's own traffic hidden"
+    if mode == "minimal":
+        opts += ", output minimal (shell bookkeeping, FindTask, DOpus "
+        opts += "probes and dos.library polls hidden)"
+    elif mode == "normal":
+        opts += ", identical repeats folded"
+    if getattr(args, "once", False):
+        opts += ", --once"
+    if until:
+        opts += ", until '%s'" % args.until
+    limit = getattr(args, "for_", None)
+    if limit:
+        opts += ", for %g s" % limit
+
+        def time_up(signum, frame):
+            raise StreamStop(EXIT_TIME_LIMIT if until else 0,
+                             "%g s are up%s" % (limit, ", '%s' never seen"
+                                               % args.until if until else ""))
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, time_up)
+            signal.setitimer(signal.ITIMER_REAL, limit)
+        else:
+            # Windows has no SIGALRM: a timer thread interrupts the main
+            # one, and the KeyboardInterrupt it raises is read as the end.
+            import _thread
+            import threading
+            def ring():
+                args._timed_out = time_up
+                _thread.interrupt_main()
+            t = threading.Timer(limit, ring)
+            t.daemon = True
+            t.start()
+    status("%s stream open to %s:%d (%s)%s - Ctrl-C to stop"
+           % (label, host, port, conn.banner, opts))
+    try:
+        while True:
+            why = follow(conn)
+            # The next connection opens with the daemon's guru replay,
+            # which may be byte-identical to the last line of this one.
+            # Folding it away would swallow the machine's explanation of
+            # why it just vanished.
+            last_line.clear()
+            for stream in sorted(partial):
+                if partial[stream]:
+                    emit(stream, "\n")   # complete the dangling line
+            if getattr(args, "once", False):
+                status("%s stream closed: %s" % (label, why))
+                return 0
+            status("%s: connection lost (%s) - reconnecting until the "
+                   "Amiga returns; Ctrl-C to stop" % (label, why))
+            conn.close()
+            gone = time.time()
+            while True:
+                try:
+                    conn = Conn(host, port, key)
+                    subscribe(conn)      # dies with the daemon: retry too
+                    break
+                except (OSError, WasabiError):
+                    time.sleep(2.0)
+            status("%s: reconnected after %d s - %s"
+                   % (label, int(time.time() - gone), conn.banner))
+    except (StreamStop, KeyboardInterrupt) as exc:
+        stop = exc
+        if isinstance(exc, KeyboardInterrupt) and \
+                getattr(args, "_timed_out", None):
+            try:                         # Windows: the timer, not a person
+                args._timed_out(None, None)
+            except StreamStop as timed:
+                stop = timed
+        if isinstance(stop, StreamStop):
+            if hasattr(signal, "setitimer"):
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            for stream in sorted(partial):
+                if partial[stream]:
+                    write_line(stream, partial.pop(stream))
+            flush_repeats()
+            status("%s stream closed: %s" % (label, stop.why))
+            return stop.code
+        for stream in sorted(partial):
+            if partial[stream]:
+                emit(stream, "\n")       # complete the dangling line
+        print(file=sys.stderr)           # step past the ^C on the tty
+        status("%s stream closed" % label)
+    finally:
+        if hasattr(signal, "setitimer"):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        conn.close()
+        if logf:
+            logf.close()
+    return 0
+
+
+def parse_size(s):
+    """'5MB', '512KB', '1GB', bare '25' means MB."""
+    m = re.match(r"^(\d+)\s*(b|kb?|mb?|gb?)?$", s.strip(), re.I)
+    if not m:
+        raise WasabiError("cannot parse size %r - try e.g. 5MB" % s)
+    mult = {"b": 1, "k": 1024, "kb": 1024, "m": 1 << 20, "mb": 1 << 20,
+            "g": 1 << 30, "gb": 1 << 30}[(m.group(2) or "mb").lower()]
+    return int(m.group(1)) * mult
+
+
+def cmd_speedtest(conn, args):
+    size = parse_size(args.size)
+    if not size or size > 256 << 20:      # the daemon's cap, same words
+        raise WasabiError("size must be 1 byte to 256 MB")
+    mb = size / float(1 << 20)
+    pattern = bytes(range(256)) * (MAX_PAYLOAD // 256)
+
+    # Latency first: PING/PONG round trips back to back, each one timed,
+    # so the line reports the spread and not just a flattering average.
+    if args.pings:
+        times = []
+        for _ in range(args.pings):
+            t0 = time.time()
+            conn.send(PING)
+            tag, _ = conn.recv()
+            if tag != PONG:
+                raise WasabiError("no PONG during the latency test")
+            times.append((time.time() - t0) * 1000.0)
+        avg = sum(times) / len(times)
+        jitter = (sum((t - avg) ** 2 for t in times) / len(times)) ** 0.5
+        print("ping  %6.2f ms     min %.2f / max %.2f / jitter %.2f"
+              "  (%d pings)"
+              % (avg, min(times), max(times), jitter, len(times)))
+
+    target = args.target or ""
+    if target:
+        if conn.caps and "speedfile" not in conn.caps:
+            raise WasabiError(
+                "this daemon (%s) cannot speedtest to a volume - update it "
+                "with 'wasabi update wasabid'" % conn.banner)
+        print("target %s (through the filesystem, not just the wire)" % target,
+              file=sys.stderr)
+
+    t0 = time.time()
+    conn.send(SPEED, struct.pack(">II", 0, size) + pack_str(target))
+    sent = 0
+    while sent < size:
+        chunk = min(MAX_PAYLOAD, size - sent)
+        conn.send(DATA, pattern[:chunk])
+        sent += chunk
+    conn.send(END)
+    conn.expect_ok()
+    up = time.time() - t0
+    print("up    %6.2f MB/s   %.1f MB in %.2f s" % (mb / up, mb, up))
+
+    t0 = time.time()
+    conn.send(SPEED, struct.pack(">II", 1, size) + pack_str(target))
+    got = [0]
+    drain_to_end(conn, lambda b: got.__setitem__(0, got[0] + len(b)))
+    down = time.time() - t0
+    if got[0] != size:
+        raise WasabiError("short download: %d of %d bytes" % (got[0], size))
+    print("down  %6.2f MB/s   %.1f MB in %.2f s" % (mb / down, mb, down))
+
+
+def write_png(path, w, h, rgb):
+    """Minimal PNG writer: zlib is stdlib, so this costs no dependency.
+
+    The Amiga sends raw pixels precisely so that this end does the
+    compressing - it is the fast machine, and it is idle while the
+    Amiga reads its framebuffer.
+    """
+    rows = b"".join(b"\0" + rgb[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data +
+                struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF))
+
+    blob = (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6))
+            + chunk(b"IEND", b""))
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    return len(blob)
+
+
+def read_png(path):
+    """Decode a PNG back to (w, h, raw RGB) — the inverse of write_png.
+
+    Only the subset write_png emits is accepted: 8-bit, colour type 2,
+    no interlace. Anything else is refused by name rather than decoded
+    wrongly, because a diff against a misread image is worse than no
+    diff. All five filter types are handled so a baseline made elsewhere
+    still works; ours are always type 0, which is also the only one that
+    avoids a per-byte Python loop.
+    """
+    with open(path, "rb") as fh:
+        blob = fh.read()
+    if blob[:8] != b"\x89PNG\r\n\x1a\n":
+        raise WasabiError("%s is not a PNG" % path)
+    pos, idat, w, h = 8, [], None, None
+    while pos + 8 <= len(blob):
+        (ln,) = struct.unpack_from(">I", blob, pos)
+        typ = blob[pos + 4:pos + 8]
+        data = blob[pos + 8:pos + 8 + ln]
+        pos += 12 + ln                      # length + type + data + CRC
+        if typ == b"IHDR":
+            w, h, depth, ctype, _comp, _filt, inter = struct.unpack(
+                ">IIBBBBB", data)
+            if (depth, ctype, inter) != (8, 2, 0):
+                raise WasabiError(
+                    "%s is %d-bit colour-type-%d%s; this client reads the "
+                    "8-bit RGB PNGs it writes" % (path, depth, ctype,
+                                                  ", interlaced" if inter
+                                                  else ""))
+        elif typ == b"IDAT":
+            idat.append(data)
+        elif typ == b"IEND":
+            break
+    if w is None or not idat:
+        raise WasabiError("%s has no image data" % path)
+
+    raw = zlib.decompress(b"".join(idat))
+    stride, out, prev, p = w * 3, bytearray(), bytearray(w * 3), 0
+    for _y in range(h):
+        if p >= len(raw):
+            raise WasabiError("%s is truncated" % path)
+        f = raw[p]
+        p += 1
+        line = bytearray(raw[p:p + stride])
+        p += stride
+        if f == 1:                          # Sub
+            for i in range(3, stride):
+                line[i] = (line[i] + line[i - 3]) & 255
+        elif f == 2:                        # Up
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 255
+        elif f == 3:                        # Average
+            for i in range(stride):
+                a = line[i - 3] if i >= 3 else 0
+                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 255
+        elif f == 4:                        # Paeth
+            for i in range(stride):
+                a = line[i - 3] if i >= 3 else 0
+                c = prev[i - 3] if i >= 3 else 0
+                b = prev[i]
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                line[i] = (line[i] + pr) & 255
+        elif f != 0:
+            raise WasabiError("%s uses unknown PNG filter %d" % (path, f))
+        out += line
+        prev = line
+    return w, h, bytes(out)
+
+
+def rgb_diff(a, b, w, h):
+    """Changed pixels and their bounding box, between two RGB buffers.
+
+    Rows are compared whole first, so an unchanged screen costs h slice
+    compares rather than w*h pixel compares — which matters, because the
+    common answer to "did anything change" is no.
+    """
+    stride = w * 3
+    changed, x0, x1, y0, y1 = 0, w, -1, h, -1
+    for y in range(h):
+        ra = a[y * stride:(y + 1) * stride]
+        rb = b[y * stride:(y + 1) * stride]
+        if ra == rb:
+            continue
+        if y < y0:
+            y0 = y
+        y1 = y
+        for x in range(w):
+            i = x * 3
+            if ra[i:i + 3] != rb[i:i + 3]:
+                changed += 1
+                if x < x0:
+                    x0 = x
+                if x > x1:
+                    x1 = x
+    return changed, (x0, y0, x1, y1) if changed else None
+
+
+def grab_pixels(conn, screen="", raw=False):
+    """Grab a screen: (width, daemon height, picture height, RGB bytes,
+    bytes on the wire, seconds). The picture height has the rows
+    doubled for native non-interlaced modes unless raw."""
+    if conn.caps and "grab" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot grab the screen - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    t0 = time.time()
+    conn.send(GRAB, pack_str(screen or ""))
+    blob = []
+    drain_to_end(conn, blob.append)
+    data = b"".join(blob)
+    if len(data) < 12:
+        raise WasabiError("the daemon sent no image data")
+    w, h, bpp = struct.unpack_from(">III", data, 0)
+    if bpp != 3:
+        raise WasabiError("the daemon sent %d bytes per pixel; this client "
+                          "understands 3 (RGB)" % bpp)
+    pixels = data[12:]
+    want = w * h * bpp
+    if len(pixels) != want:
+        raise WasabiError("short grab: %d of %d bytes for %dx%d"
+                          % (len(pixels), want, w, h))
+    grabbed = time.time() - t0
+
+    # A native non-interlaced screen has pixels twice as wide as they
+    # are tall - 640x256 fills a whole 4:3 monitor - so a straight dump
+    # looks squished to half height. Double the rows until the shape is
+    # plausible again: 640x256 becomes 640x512, superhires 1280x256
+    # doubles twice. Safe by construction - no square-pixel mode is
+    # ever 2:1 or wider, so an RTG screen is never touched. --raw keeps
+    # the pixels exactly as the daemon read them.
+    out_h = h
+    if not raw:
+        rowbytes = w * 3
+        while out_h and w >= 2 * out_h:
+            pixels = b"".join(
+                pixels[y * rowbytes:(y + 1) * rowbytes] * 2
+                for y in range(out_h))
+            out_h *= 2
+    return w, h, out_h, pixels, want, grabbed
+
+
+def crop_rgb(pixels, w, box):
+    """Cut (x0, y0, x1, y1), exclusive ends, out of RGB rows w wide."""
+    x0, y0, x1, y1 = box
+    rowbytes = w * 3
+    return b"".join(pixels[y * rowbytes + x0 * 3:y * rowbytes + x1 * 3]
+                    for y in range(y0, y1))
+
+
+GRAB_DIR = os.path.join(os.environ.get("TMPDIR") or
+                        __import__("tempfile").gettempdir(), "wasabi-grab")
+
+
+def cmd_grab(conn, args):
+    """Grab a screen - or one window on it - to a PNG.
+
+    With no file named, each grab goes to a new file in GRAB_DIR, so
+    nothing is overwritten. The path is the one line on stdout (or
+    --json), so a script or a program that reads pictures can open it;
+    the details go to stderr.
+    """
+    box, label, k = None, "screen", 1
+    if NATIVE:
+        args.raw = True                  # the screen's own pixels
+    if args.region and args.window is not None:
+        raise WasabiError("--region or --window, not both")
+    if args.region:
+        try:
+            rx, ry, rw, rh = (int(v) for v in args.region.split(","))
+        except ValueError:
+            raise WasabiError("--region X,Y,W,H - four numbers, e.g. "
+                              "--region 0,0,320,40")
+        box = (rx, ry, rx + rw, ry + rh)
+        label = "region %d,%d %dx%d" % (rx, ry, rw, rh)
+    if args.window is not None:
+        if args.screen:
+            raise WasabiError(
+                "--window finds its own screen - drop --screen (and if "
+                "that screen is not in front, bring it with "
+                "'wasabi screen --to-front')")
+        screens, _ = list_windows(conn)
+        sc, win = find_window(screens, args.window)
+        if not win:
+            raise WasabiError("no window with '%s' in its title - "
+                              "'wasabi windows' lists them" % args.window)
+        if not sc["front"]:
+            raise WasabiError(
+                "'%s' is on the screen \"%s\", which is not in front - "
+                "bring it with: wasabi screen --to-front \"%s\""
+                % (win["title"], sc["title"], sc["title"]))
+        # The window list is in the picture's pixels; --raw keeps the
+        # screen's own rows, so undo the doubling for the crop.
+        k = sc["row_scale"] if args.raw else 1
+        box = (win["left"], win["top"] // k, win["left"] + win["width"],
+               (win["top"] + win["height"]) // k)
+        label = 'window "%s"' % win["title"]
+
+    w, h, out_h, pixels, want, grabbed = grab_pixels(
+        conn, args.screen, args.raw)
+    if box:
+        x0, y0 = max(0, box[0]), max(0, box[1])
+        x1, y1 = min(w, box[2]), min(out_h, box[3])
+        if x1 <= x0 or y1 <= y0:
+            raise WasabiError("%s is off the screen" % label)
+        pixels = crop_rgb(pixels, w, (x0, y0, x1, y1))
+        w, out_h = x1 - x0, y1 - y0
+
+    path = args.file
+    if not path:
+        os.makedirs(GRAB_DIR, exist_ok=True)
+        path = os.path.join(GRAB_DIR, "grab-%s-%03d.png" % (
+            time.strftime("%Y%m%d-%H%M%S"), int(time.time() % 1 * 1000)))
+    size = write_png(path, w, out_h, pixels)
+    if box:
+        what = "%s, %dx%d" % (label, w, out_h)
+    else:
+        what = "%dx%d" % (w, h) + (" (rows doubled to %dx%d)" % (w, out_h)
+                                    if out_h != h else "")
+    print("%s -> %s (%d KB, %.1f MB raw in %.1f s)"
+          % (what, path, size // 1024, want / 1e6, grabbed),
+          file=sys.stderr)
+
+    # Comparing against a baseline is entirely this end's work: the Amiga
+    # already sent raw pixels precisely so the fast idle machine does the
+    # thinking. Exit status follows diff(1) - 0 identical, 1 changed - so
+    # "did that command touch the screen" is answerable from a script.
+    result = {"path": path, "width": w, "height": out_h, "what": label}
+    rc = 0
+    if args.diff:
+        bw, bh, base = read_png(args.diff)
+        if (bw, bh) != (w, out_h):
+            raise WasabiError(
+                "%s is %dx%d and this grab is %dx%d - a diff needs the same "
+                "size on both sides (the same screen mode, the same window "
+                "size)" % (args.diff, bw, bh, w, out_h))
+        changed, dbox = rgb_diff(base, pixels, w, out_h)
+        total = w * out_h
+        result["changed_pixels"] = changed
+        if not changed:
+            print("diff vs %s: identical" % args.diff, file=sys.stderr)
+        else:
+            result["changed_box"] = list(dbox)
+            print("diff vs %s: %d of %d pixels changed (%.2f%%), "
+                  "bounding box %d,%d - %d,%d"
+                  % (args.diff, changed, total, 100.0 * changed / total,
+                     dbox[0], dbox[1], dbox[2], dbox[3]), file=sys.stderr)
+            rc = 1
+    if args.json:
+        emit_json(result)
+    else:
+        print(path)
+    return rc
+
+
+def fetch(conn, path):
+    """A file's bytes, or None if the Amiga says it is not there."""
+    conn.send(GET, pack_str(path))
+    out = []
+    try:
+        drain_to_end(conn, out.append)
+    except WasabiError:
+        return None
+    return b"".join(out)
+
+
+def window_box(conn, title):
+    """(x0, y0, x1, y1) of a window on the front screen, for comparing
+    just that part of a grab."""
+    screens, _ = list_windows(conn)
+    sc, win = find_window(screens, title)
+    if not win:
+        raise WasabiError("no window with '%s' in its title" % title)
+    if not sc["front"]:
+        raise WasabiError("'%s' is not on the front screen" % win["title"])
+    return (win["left"], win["top"], win["left"] + win["width"],
+            win["top"] + win["height"])
+
+
+def parse_region(text):
+    """'X,Y,W,H' -> (x0, y0, x1, y1)."""
+    try:
+        rx, ry, rw, rh = (int(v) for v in text.split(","))
+    except ValueError:
+        raise WasabiError("--region X,Y,W,H - four numbers, e.g. "
+                          "--region 0,0,320,40")
+    return (rx, ry, rx + rw, ry + rh)
+
+
+def front_scale(conn, native=False):
+    """The front screen's row doubling, as the picture has it; 1 for a
+    box already in the screen's own pixels (--region with --native).
+    Window boxes are always in the picture's pixels."""
+    if native:
+        return 1
+    screens, _ = list_windows(conn)
+    return screens[0]["row_scale"] if screens else 1
+
+
+def region_sum(conn, box, k=1):
+    """Ask the Amiga for a checksum of a box of the front screen (the
+    whole screen if box is None): (sum, pixels). Only four bytes come
+    back, whatever the size. box is in picture pixels; k is the front
+    screen's row doubling, undone here for the daemon."""
+    if box:
+        x0, y0, x1, y1 = box
+        hdr = struct.pack(">hhhh", x0, y0 // k, x1 - x0,
+                          max(1, (y1 - y0) // k))
+    else:
+        hdr = struct.pack(">hhhh", 0, 0, 0, 0)
+    conn.send(SUM, hdr)
+    out = []
+    drain_to_end(conn, out.append)
+    data = b"".join(out)
+    if len(data) < 8:
+        raise WasabiError("short answer to SUM")
+    return struct.unpack(">II", data[:8])
+
+
+def cmd_sum(conn, args):
+    """A checksum of the screen, a window or a region, computed on the
+    Amiga: compare two to see whether anything there changed without
+    sending a picture. Exits 1 with --since when it is unchanged."""
+    if args.region and args.window is not None:
+        raise WasabiError("--region or --window, not both")
+    box = parse_region(args.region) if args.region else \
+        window_box(conn, args.window) if args.window is not None else None
+    k = front_scale(conn, NATIVE and bool(args.region)) if box else 1
+    total, n = region_sum(conn, box, k)
+    hexsum = "%08x" % total
+    changed = None
+    if args.since is not None:
+        since = args.since.lower()
+        changed = hexsum != (since[2:] if since.startswith("0x") else since)
+    if args.json:
+        out = {"sum": hexsum, "pixels": n}
+        if changed is not None:
+            out["changed"] = changed
+        emit_json(out)
+    else:
+        print(hexsum)
+        print("%d pixels%s" % (n, "" if changed is None else
+                               ", changed" if changed else ", unchanged"),
+              file=sys.stderr)
+    return 1 if changed is False else 0
+
+
+def screen_now(conn, box, k=None):
+    """Something that differs when the screen (or box of it) does: the
+    Amiga's own checksum when it has one, else a crc of a grab."""
+    if "sum" in conn.caps:
+        return region_sum(conn, box, k or 1)
+    w, _, h, pixels, _, _ = grab_pixels(conn)
+    if box:
+        x0, y0 = max(0, box[0]), max(0, box[1])
+        x1, y1 = min(w, box[2]), min(h, box[3])
+        pixels = crop_rgb(pixels, w, (x0, y0, x1, y1))
+    return zlib.crc32(pixels), len(pixels)
+
+
+def cmd_wait(conn, args):
+    """Wait for something to happen on the Amiga, instead of guessing
+    with pauses. Exit 0 when it happens, 124 when --timeout runs out.
+
+    The thing is checked every --every seconds over one connection;
+    each check is one small command (a window list, a task list, a
+    file read) or, for the screen, one grab.
+    """
+    what, target = args.what, args.target
+    if what in ("window", "task", "file") and not target:
+        raise WasabiError("wait %s needs a name: wasabi wait %s NAME"
+                          % (what, what))
+    t0 = time.time()
+    deadline = t0 + args.timeout
+    box, k = None, None
+    if what in ("change", "still"):
+        if args.region and target:
+            raise WasabiError("a window title or --region, not both")
+        box = parse_region(args.region) if args.region else \
+            window_box(conn, target) if target else None
+        if box and "sum" in conn.caps:
+            k = front_scale(conn, NATIVE and bool(args.region))
+    first = screen_now(conn, box, k) if what in ("change", "still") \
+        else None
+    last_change = time.time()
+    detail = ""
+
+    while True:
+        met = False
+        if what == "window":
+            screens, _ = list_windows(conn)
+            sc, win = find_window(screens, target)
+            met = (win is None) if args.gone else (win is not None)
+            if win and not args.gone:
+                detail = '"%s" at %d,%d %dx%d' % (
+                    win["title"], win["left"], win["top"], win["width"],
+                    win["height"])
+        elif what == "task":
+            rows, _ = ps_rows(conn, target)
+            met = (not rows) if args.gone else bool(rows)
+            if rows and not args.gone:
+                detail = rows[0][7] + (" (%s)" % rows[0][8]
+                                       if rows[0][8] else "")
+        elif what == "file":
+            data = fetch(conn, target)
+            if args.gone:
+                met = data is None
+            elif data is not None:
+                if args.contains is None:
+                    met = True
+                else:
+                    text = data.decode("latin-1")
+                    met = args.contains.lower() in text.lower()
+                    if met:
+                        detail = next(
+                            (ln for ln in text.splitlines()
+                             if args.contains.lower() in ln.lower()), "")
+        elif what == "change":
+            met = screen_now(conn, box, k) != first
+        elif what == "still":
+            now_shot = screen_now(conn, box, k)
+            if now_shot != first:
+                first, last_change = now_shot, time.time()
+            met = time.time() - last_change >= args.quiet
+        took = time.time() - t0
+        if met:
+            if args.json:
+                emit_json({"met": True, "seconds": round(took, 2),
+                           "detail": detail})
+            else:
+                print("%s after %.1f s%s"
+                      % (wait_words(args), took,
+                         (": " + detail) if detail else ""))
+            return 0
+        if time.time() >= deadline:
+            if args.json:
+                emit_json({"met": False, "seconds": round(took, 2)})
+            raise TimeLimit("%s within %g s"
+                            % (wait_words(args, done=False), args.timeout))
+        time.sleep(min(args.every, max(0.0, deadline - time.time())))
+
+
+def wait_words(args, done=True):
+    """What was waited for, in words: 'window "Prefs" appeared'."""
+    t = args.target
+    if args.what == "window":
+        thing = 'a window titled "%s"' % t
+        verb = "closed" if args.gone else "appeared"
+    elif args.what == "task":
+        thing = "task %s" % t
+        verb = "ended" if args.gone else "is running"
+    elif args.what == "file":
+        thing = t
+        verb = ("vanished" if args.gone else
+                "contains '%s'" % args.contains if args.contains is not None
+                else "appeared")
+    elif args.what == "change":
+        thing, verb = ('window "%s"' % t if t else "the screen"), "changed"
+    else:
+        thing = 'window "%s"' % t if t else "the screen"
+        verb = "settled (still for %g s)" % args.quiet
+    if not done:
+        verb = {"appeared": "appear", "closed": "close", "ended": "end",
+                "is running": "start", "vanished": "vanish",
+                "changed": "change"}.get(verb, verb)
+        if verb.startswith("contains"):
+            verb = "come to contain" + verb[len("contains"):]
+        elif verb.startswith("settled"):
+            verb = "settle" + verb[len("settled"):]
+        return "%s did not %s" % (thing, verb)
+    return "%s %s" % (thing, verb)
+
+
+def cmd_wait_up(args):
+    """Wait until the Amiga answers - after a reboot, or a power-on.
+    Needs no connection to start with, so it is not run through the
+    usual connect-first path."""
+    t0 = time.time()
+    deadline = t0 + args.timeout
+    host, port = resolve_target(args)
+    while True:
+        try:
+            c = Conn(host, port, args.key, timeout=min(5.0, SILENCE))
+            banner = c.banner
+            c.close()
+            took = time.time() - t0
+            if args.json:
+                emit_json({"met": True, "seconds": round(took, 2),
+                           "detail": banner})
+            else:
+                print("the Amiga answers after %.1f s: %s" % (took, banner))
+            return 0
+        except (OSError, WasabiError):
+            pass
+        if time.time() >= deadline:
+            raise TimeLimit("the Amiga did not answer within %g s"
+                            % args.timeout)
+        time.sleep(1.0)
+
+
+# The firmware's "get throttled" bits: what is happening now (low
+# nibble), and what has happened at any time since the Pi booted
+# (bits 16-19) - the latter catches a dip too short for any poll.
+THROTTLE_BITS = ((0, "under-voltage"), (1, "ARM clock capped"),
+                 (2, "throttled"), (3, "soft temperature limit"))
+
+
+def health_read(conn):
+    """One HEALTH reading as a dict of the daemon's key -> value text,
+    stamped with this end's clock."""
+    conn.send(HEALTH)
+    text = []
+    drain_to_end(conn, text.append)
+    d = {}
+    for line in b"".join(text).decode("latin-1").splitlines():
+        k, _, v = line.partition(" ")
+        if k:
+            d[k] = v
+    d["_t"] = time.time()
+    return d
+
+
+def _num(d, k):
+    v = d.get(k)
+    if v is None:
+        return None
+    try:
+        return int(v, 0)
+    except ValueError:
+        return None
+
+
+def health_facts(cur, prev=None):
+    """The reading as numbers people use: degrees, volts, MHz, KB,
+    MIPS (from two readings), and the throttle flags as words."""
+    f = {}
+    for k in ("chip", "fast"):
+        for part in ("free", "largest", "total"):
+            v = _num(cur, "mem.%s.%s" % (k, part))
+            if v is not None:
+                f["%s_%s_kb" % (k, part)] = v // 1024
+    f["emu68"] = cur.get("emu68") == "yes"
+    if f["emu68"]:
+        ver = cur.get("emu68.version") or ""
+        f["emu68_version"] = ver[6:] if ver.startswith("Emu68 ") else ver
+        f["pi_model"] = cur.get("pi.model")
+        frq, cnt = _num(cur, "emu68.cntfrq"), _num(cur, "emu68.cnt")
+        if frq and cnt is not None:
+            f["uptime_s"] = cnt // frq
+        size, free = _num(cur, "emu68.jit.size"), _num(cur, "emu68.jit.free")
+        if size:
+            f["jit_used_pct"] = round(100.0 * (size - (free or 0)) / size, 1)
+        f["jit_misses"] = _num(cur, "emu68.jit.misses")
+        if prev and prev.get("emu68") == "yes":
+            # Seconds from Emu68's own counter, not this end's clock: the
+            # network's delay must not change the CPU meter.
+            dc = (cnt or 0) - (_num(prev, "emu68.cnt") or 0)
+            if frq and dc > 0:
+                secs = dc / float(frq)
+                f["mips_68k"] = round(((_num(cur, "emu68.insn") or 0) -
+                                       (_num(prev, "emu68.insn") or 0))
+                                      / secs / 1e6, 1)
+                f["mips_arm"] = round(((_num(cur, "emu68.arminsn") or 0) -
+                                       (_num(prev, "emu68.arminsn") or 0))
+                                      / secs / 1e6, 1)
+    f["mailbox"] = cur.get("mailbox") == "yes"
+    t = _num(cur, "pi.temp")
+    if t is not None:
+        f["temp_c"] = round(t / 1000.0, 1)
+    t = _num(cur, "pi.temp.max")
+    if t is not None:
+        f["temp_max_c"] = round(t / 1000.0, 1)
+    v = _num(cur, "pi.volt.core")
+    if v is not None:
+        f["core_v"] = round(v / 1e6, 3)
+    for k, name in (("pi.clock.arm", "arm_mhz"),
+                    ("pi.clock.arm.measured", "arm_measured_mhz"),
+                    ("pi.clock.arm.max", "arm_max_mhz"),
+                    ("pi.clock.core", "core_mhz")):
+        v = _num(cur, k)
+        if v is not None:
+            f[name] = int(round(v / 1e6))
+    th = _num(cur, "pi.throttled")
+    if th is not None:
+        f["throttled_raw"] = "0x%05x" % th
+        f["problems_now"] = [w for b, w in THROTTLE_BITS if th & (1 << b)]
+        f["problems_since_boot"] = [w for b, w in THROTTLE_BITS
+                                    if th & (1 << (b + 16))]
+    return f
+
+
+def _kb(k):
+    return "%d MB" % (k // 1024) if k >= 10240 else "%d KB" % k
+
+
+def health_text(f):
+    out = []
+    if "temp_c" in f:
+        pi = "Pi%s: %.1f °C" % (" (%s)" % f["pi_model"]
+                                if f.get("pi_model") else "", f["temp_c"])
+        if "temp_max_c" in f:
+            pi += " (limit %.0f)" % f["temp_max_c"]
+        if "core_v" in f:
+            pi += ", core %.2f V" % f["core_v"]
+        if "arm_mhz" in f:
+            pi += ", ARM %d MHz" % f["arm_mhz"]
+            if f.get("arm_measured_mhz") and \
+                    abs(f["arm_measured_mhz"] - f["arm_mhz"]) > 5:
+                pi += " (measured %d)" % f["arm_measured_mhz"]
+        out.append(pi)
+    if "problems_now" in f:
+        now, ever = f["problems_now"], f["problems_since_boot"]
+        if now:
+            out.append("power: PROBLEM NOW - %s" % ", ".join(now))
+        if ever:
+            out.append("power: since boot there was %s" % ", ".join(ever))
+        if not now and not ever:
+            out.append("power: OK - no under-voltage or throttling "
+                       "since boot")
+    elif not f.get("mailbox"):
+        out.append("Pi: not available (no mailbox.resource - not Emu68 "
+                   "on a Pi)")
+    if f.get("emu68"):
+        e = "Emu68 %s" % (f.get("emu68_version") or "")
+        if "uptime_s" in f:
+            u = f["uptime_s"]
+            e += ": Pi up %d h %02d min" % (u // 3600, u % 3600 // 60)
+        if "mips_68k" in f:
+            e += ", 68k %.1f MIPS (ARM %.0f)" % (f["mips_68k"],
+                                                f["mips_arm"])
+        if "jit_used_pct" in f:
+            e += ", JIT cache %.0f%% used" % f["jit_used_pct"]
+        if f.get("jit_misses") is not None:
+            e += ", %d misses" % f["jit_misses"]
+        out.append(e)
+    else:
+        out.append("Emu68: no (counters not available)")
+    if "chip_free_kb" in f:
+        out.append("memory: chip %s free (largest block %s), "
+                   "fast %s free (largest %s)"
+                   % (_kb(f["chip_free_kb"]), _kb(f["chip_largest_kb"]),
+                      _kb(f.get("fast_free_kb", 0)),
+                      _kb(f.get("fast_largest_kb", 0))))
+    if f.get("last_guru"):
+        out.append("last guru: %s" % f["last_guru"])
+    return out
+
+
+def last_guru(conn):
+    """The daemon's note of the last system alert (T:lastguru), first
+    line only, or None."""
+    data = fetch(conn, "T:lastguru")
+    if not data:
+        return None
+    lines = [ln.strip() for ln in data.decode("latin-1").splitlines()
+             if ln.strip()]
+    return lines[0] if lines else None
+
+
+def cmd_health(conn, args):
+    """The machine's vital signs: the Pi's temperature, voltage, clock
+    and power history; Emu68's uptime, CPU meter and JIT cache; free
+    memory. --watch repeats it until Ctrl-C."""
+    if conn.caps and "health" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) has no health readings - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    # The CPU meter is a rate, so it needs two readings. One second
+    # apart is the price of a one-shot; --watch gets it for free.
+    prev = health_read(conn)
+    interval = args.watch if args.watch else 1.0
+    try:
+        while True:
+            time.sleep(max(0.2, interval - (time.time() - prev["_t"])))
+            cur = health_read(conn)
+            f = health_facts(cur, prev)
+            f["last_guru"] = last_guru(conn)
+            if args.raw:
+                print("\n".join("%s %s" % kv for kv in cur.items()
+                                if kv[0] != "_t"))
+            elif args.json:
+                emit_json(f)
+            else:
+                if args.watch:
+                    print(time.strftime("%H:%M:%S"))
+                print("\n".join(health_text(f)))
+            sys.stdout.flush()
+            if not args.watch:
+                bad = f.get("problems_now")
+                return 1 if bad else 0
+            prev = cur
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 0
+
+
+def cmd_view(args):
+    """The Amiga's screen in a window, with its mouse and keyboard.
+    The bridge lives in app/wasabi_view.py next to this script."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "app")
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import wasabi_view
+    target = resolve_target(args)
+    return wasabi_view.serve(sys.modules[__name__], args, target)
+
+
+def clip_get(conn):
+    """The Amiga clipboard's text (Latin-1 on the Amiga), or ''."""
+    conn.send(CLIP, struct.pack(">I", 0))
+    out = []
+    drain_to_end(conn, out.append)
+    return b"".join(out).decode("latin-1")
+
+
+def clip_set(conn, text):
+    data = text.encode("latin-1", "replace")
+    conn.send(CLIP, struct.pack(">I", 1) + data)
+    conn.expect_ok()
+
+
+def cmd_clip(conn, args):
+    """Read or set the Amiga's clipboard: what Copy put there, and what
+    Paste (Right Amiga+V) will give."""
+    if conn.caps and "clip" not in conn.caps:
+        raise WasabiError("this daemon (%s) has no clipboard - update it "
+                          "with 'wasabi update wasabid'" % conn.banner)
+    if args.action == "get":
+        text = clip_get(conn)
+        if args.json:
+            emit_json({"text": text})
+        else:
+            sys.stdout.write(text)
+            if text and not text.endswith("\n"):
+                sys.stdout.write("\n")
+        return 0
+    text = args.text if args.text is not None and args.text != "-" \
+        else sys.stdin.read()
+    clip_set(conn, text)
+    print("put %d character(s) on the Amiga's clipboard" % len(text),
+          file=sys.stderr)
+
+
+NOPOS = -32768                  # MOUSE x/y: "where the pointer is"
+MOUSE_ACTIONS = {"move": 0, "click": 1, "doubleclick": 1, "down": 2, "up": 3}
+BUTTONS = {"left": 0, "right": 1, "middle": 2}
+
+
+def send_mouse(conn, action, x=None, y=None, button=0, count=1):
+    """One MOUSE command: action 0 move, 1 click (count times), 2 press
+    and hold, 3 release. x/y None: where the pointer already is."""
+    conn.send(MOUSE, struct.pack(">HHHhh", action, button,
+                                 count if action == 1 else 0,
+                                 NOPOS if x is None else x,
+                                 NOPOS if y is None else y))
+    conn.expect_ok()
+
+
+def send_keys(conn, events):
+    """Raw (code, qualifier) key events, in one KEY command."""
+    conn.send(KEY, struct.pack(">H", 0) +
+              b"".join(struct.pack(">HH", c, q) for c, q in events))
+    conn.expect_ok()
+
+
+def latin1(text):
+    try:
+        return text.encode("latin-1")
+    except UnicodeEncodeError as e:
+        raise WasabiError("the Amiga cannot type %r (not Latin-1)"
+                          % text[e.start])
+
+
+def send_text(conn, text):
+    """Type TEXT through the Amiga's own keymap ("\n" is Return)."""
+    data = latin1(text.replace("\r\n", "\n").replace("\n", "\r"))
+    if len(data) > 2048:
+        raise WasabiError("at most 2048 characters per 'key type'")
+    conn.send(KEY, struct.pack(">H", 1) + data)
+    conn.expect_ok()
+
+
+def cmd_mouse(conn, args):
+    """Move the pointer and click - drive GUIs remotely.
+
+    The daemon writes real InputEvents with IND_WRITEEVENT, so
+    Intuition treats them exactly like the physical mouse: the window
+    under the pointer gets the click, double-click timing comes from
+    event timestamps. Coordinates are absolute screen pixels in the
+    same space `grab` delivers - grab, look, click.
+    """
+    if args.action == "wheel":
+        return mouse_wheel(conn, args)
+    if args.action == "where":
+        screens, _ = list_windows(conn)
+        front = screens[0] if screens else None
+        if not front or "pointer" not in front:
+            raise WasabiError("this daemon (%s) does not say where the "
+                              "pointer is - update it with 'wasabi update "
+                              "wasabid'" % conn.banner)
+        native_out(screens)
+        x, y = front["pointer"]
+        if args.json:
+            emit_json({"x": x, "y": y, "screen": front["title"]})
+        else:
+            print("%d %d" % (x, y))
+        return
+    if NATIVE and isinstance(args.y, int):
+        # The screen's own pixels in; the daemon counts the picture's.
+        screens, _ = list_windows(conn)
+        if screens:
+            args.y *= screens[0]["row_scale"]
+    if isinstance(args.x, str) or isinstance(args.y, str):
+        raise WasabiError("up and down are for 'mouse wheel'")
+    if args.action == "move" and (args.x is None or args.y is None):
+        raise WasabiError("mouse move needs X and Y")
+    button = 1 if args.right else (2 if args.middle else 0)
+    send_mouse(conn, MOUSE_ACTIONS[args.action], args.x, args.y, button,
+               2 if args.action == "doubleclick" else 1)
+
+
+def mouse_arg(v):
+    """A mouse coordinate or count, or a wheel direction."""
+    if v in ("up", "down"):
+        return v
+    try:
+        return int(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "must be a number (or up or down for the wheel), not %r" % v)
+
+
+def mouse_wheel(conn, args):
+    """Turn the wheel: `mouse wheel up|down [N]`. The Amiga has no wheel
+    of its own; this sends the NewMouse raw keys (0x7A/0x7B) a wheel
+    driver would, the same as `key press wheelup`."""
+    if args.x not in ("up", "down") or isinstance(args.y, str):
+        raise WasabiError("mouse wheel needs up or down, e.g. "
+                          "'wasabi mouse wheel down 3'")
+    n = 1 if args.y is None else args.y
+    if not 1 <= n <= 100:
+        raise WasabiError("mouse wheel: the count must be 1 to 100")
+    if conn.caps and "key" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) has no keyboard, so no wheel - update it "
+            "with 'wasabi update wasabid'" % conn.banner)
+    send_keys(conn, key_combo_events("wheel" + args.x) * n)
+
+
+# Amiga raw key codes - key *positions*, the same on every Amiga
+# keyboard whatever its keymap. `key press` names keys by these; for
+# text, `key type` lets the Amiga's own keymap pick the keys instead.
+RAWKEYS = {"`": 0x00, "-": 0x0B, "=": 0x0C, "\\": 0x0D,
+           "[": 0x1A, "]": 0x1B, ";": 0x29, "'": 0x2A,
+           ",": 0x38, ".": 0x39, "/": 0x3A,
+           "space": 0x40, "backspace": 0x41, "tab": 0x42, "enter": 0x43,
+           "return": 0x44, "esc": 0x45, "escape": 0x45, "del": 0x46,
+           "delete": 0x46, "up": 0x4C, "down": 0x4D, "right": 0x4E,
+           "left": 0x4F, "help": 0x5F,
+           # the mouse wheel, as the NewMouse convention sends it
+           "wheelup": 0x7A, "wheeldown": 0x7B}
+for _i, _c in enumerate("1234567890"):
+    RAWKEYS[_c] = 0x01 + _i
+for _row, _base in (("qwertyuiop", 0x10), ("asdfghjkl", 0x20),
+                    ("zxcvbnm", 0x31)):
+    for _i, _c in enumerate(_row):
+        RAWKEYS[_c] = _base + _i
+for _i in range(10):
+    RAWKEYS["f%d" % (_i + 1)] = 0x50 + _i
+# PC-keyboard keys as OS 3.2/3.9 and AROS number them, and the keypad.
+RAWKEYS.update({"f11": 0x4B, "f12": 0x6F, "insert": 0x47, "ins": 0x47,
+                "pageup": 0x48, "pgup": 0x48, "pagedown": 0x49,
+                "pgdn": 0x49, "home": 0x70, "end": 0x71,
+                "kpdot": 0x3C, "kpenter": 0x43, "kpminus": 0x4A,
+                "kplparen": 0x5A, "kprparen": 0x5B, "kpslash": 0x5C,
+                "kpstar": 0x5D, "kpplus": 0x5E})
+for _i, _c in enumerate((0x0F, 0x1D, 0x1E, 0x1F, 0x2D, 0x2E, 0x2F, 0x3D,
+                         0x3E, 0x3F)):
+    RAWKEYS["kp%d" % _i] = _c
+
+# Modifier name -> (its own raw key, its qualifier bit).
+MODIFIERS = {"shift": (0x60, 0x01), "lshift": (0x60, 0x01),
+             "rshift": (0x61, 0x02), "ctrl": (0x63, 0x08),
+             "alt": (0x64, 0x10), "lalt": (0x64, 0x10),
+             "ralt": (0x65, 0x20), "lamiga": (0x66, 0x40),
+             "ramiga": (0x67, 0x80), "amiga": (0x67, 0x80)}
+KEY_UP = 0x80
+
+
+def key_combo_events(combo):
+    """'ramiga+shift+q' -> raw (code, qualifier) events, pressed in
+    order and released in reverse, the way fingers do it."""
+    *mods, key = combo.lower().split("+")
+    events, qual = [], 0
+    for m in mods:
+        if m not in MODIFIERS:
+            raise WasabiError("unknown modifier %r (known: %s)"
+                              % (m, ", ".join(sorted(MODIFIERS))))
+        code, bit = MODIFIERS[m]
+        qual |= bit
+        events.append((code, qual))
+    if key in MODIFIERS:
+        code = MODIFIERS[key][0]
+    elif key in RAWKEYS:
+        code = RAWKEYS[key]
+    elif re.fullmatch(r"0x[0-7][0-9a-f]", key):
+        code = int(key, 16)              # any raw key code by number
+    else:
+        raise WasabiError("unknown key %r - use 'key type' for text"
+                          % key)
+    events.append((code, qual))
+    events.append((code | KEY_UP, qual))
+    for m in reversed(mods):
+        code, bit = MODIFIERS[m]
+        qual &= ~bit
+        events.append((code | KEY_UP, qual))
+    return events
+
+
+def cmd_key(conn, args):
+    """Type on the Amiga's keyboard from here.
+
+    `type` sends characters and the Amiga's own keymap decides which
+    keys make them, so a Swedish keymap types a Swedish 'å' correctly.
+    `press` sends key positions by name, with modifiers: return, esc,
+    f1, ramiga+w, ctrl+c.
+    """
+    if conn.caps and "key" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) has no keyboard - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    if args.action == "type":
+        send_text(conn, " ".join(args.keys) + ("\r" if args.enter else ""))
+    else:
+        events = []
+        for combo in args.keys:
+            events += key_combo_events(combo)
+        send_keys(conn, events)
+
+
+def row_scale(w, h):
+    """How many times `grab` doubles a screen's rows - the rule lives
+    here so the window list and a window grab agree with the picture. 1 for
+    every square-pixel (RTG) mode; 2 for 640x256; 4 for 1280x256."""
+    k = 1
+    while h and w >= 2 * h * k:
+        k *= 2
+    return k
+
+
+def list_windows(conn):
+    """Every screen, front first, each with its windows, front first.
+
+    Window y and height are in the picture's space - multiplied by the
+    screen's row_scale - so they match `grab` and `mouse`.
+    `raw` keeps the daemon's own lines."""
+    if conn.caps and "windows" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot list windows - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    conn.send(WINDOWS)
+    text = []
+    drain_to_end(conn, text.append)
+    screens, raw = [], []
+    for line in b"".join(text).decode("latin-1").splitlines():
+        raw.append(line)
+        f = line.split("\t")
+        if f[0] == "S" and len(f) >= 8:
+            w, h = int(f[4]), int(f[5])
+            k = row_scale(w, h)
+            screens.append({"addr": f[1], "title": f[7], "left": int(f[2]),
+                            "top": int(f[3]), "width": w, "height": h,
+                            "depth": int(f[6]), "row_scale": k,
+                            "front": not screens, "windows": []})
+            if len(f) >= 10:             # wasabid 0.9b3+: the pointer
+                screens[-1]["pointer"] = [int(f[8]), int(f[9]) * k]
+        elif f[0] == "W" and len(f) >= 13 and screens:
+            k = screens[-1]["row_scale"]
+            screens[-1]["windows"].append({
+                "addr": f[1], "title": f[12], "task": f[11],
+                "left": int(f[2]), "top": int(f[3]) * k,
+                "width": int(f[4]), "height": int(f[5]) * k,
+                "border": [int(f[6]), int(f[7]) * k, int(f[8]),
+                           int(f[9]) * k],
+                "active": "a" in f[10], "backdrop": "b" in f[10]})
+    return screens, raw
+
+
+def find_window(screens, title):
+    """The frontmost window whose title contains TITLE (any case), and
+    its screen; (None, None) when there is none."""
+    t = title.lower()
+    for sc in screens:
+        for win in sc["windows"]:
+            if t in win["title"].lower():
+                return sc, win
+    return None, None
+
+
+def native_out(screens, native=None):
+    """With --native: the screen's own pixels in what is shown - undo
+    the picture's row doubling in every y and height."""
+    if not (NATIVE if native is None else native):
+        return screens
+    for sc in screens:
+        k = sc["row_scale"]
+        if k == 1:
+            continue
+        if "pointer" in sc:
+            sc["pointer"][1] //= k
+        for w in sc["windows"]:
+            w["top"] //= k
+            w["height"] //= k
+            if "border" in w:
+                w["border"][1] //= k
+                w["border"][3] //= k
+            for g in w.get("gadgets", []):
+                g["y"] //= k
+                g["height"] //= k
+    return screens
+
+
+def cmd_windows(conn, args):
+    """Every screen and its windows, front first.
+
+    Positions are relative to the screen and in the picture's pixels -
+    the same `grab` shows and `mouse` clicks - so a window's close gadget
+    is at its top-left corner plus a few pixels, from facts rather than
+    guesses.
+    """
+    screens, raw = list_windows(conn)
+    if args.raw:
+        print("\n".join(raw))
+        return
+    native_out(screens)
+    if args.json:
+        emit_json(screens)
+        return
+    for sc in screens:
+        print('screen "%s"  %dx%d, %d bit%s%s'
+              % (sc["title"], sc["width"], sc["height"], sc["depth"],
+                 "" if not sc["top"] else
+                 ", pulled down to y=%d" % sc["top"],
+                 "" if sc["row_scale"] == 1 else
+                 ", rows x%d as in grab" % sc["row_scale"]))
+        for win in sc["windows"]:
+            flags = [n for n in ("active", "backdrop") if win[n]]
+            print('  window "%s"  at %d,%d  %dx%d  task %s%s'
+                  % (win["title"], win["left"], win["top"], win["width"],
+                     win["height"], win["task"],
+                     "  [%s]" % ", ".join(flags) if flags else ""))
+
+
+# --- the GUI as objects: gadgets and menus by name --------------------
+
+SYSTEM_KINDS = ("close", "depth", "zoom", "size", "drag", "sdepth", "sdrag")
+
+
+def ui_norm(s):
+    """How names are compared: any case, no shortcut underscore, no
+    trailing colon or dots, spaces folded - 'Save _As...' == 'save as'."""
+    s = s.replace("_", "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s.rstrip(".:… ").strip()
+
+
+def read_ui(conn, every_screen=False):
+    """Screens, front first, each with its windows, each with its
+    gadgets and menu items - all in grab's pixel space, like `windows`.
+
+    A gadget's x/y/width/height are relative to its screen, so its
+    centre is where `mouse click` goes."""
+    if conn.caps and "ui" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot list gadgets - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    conn.send(UI, struct.pack(">I", 1 if every_screen else 0))
+    text = []
+    drain_to_end(conn, text.append)
+    screens = []
+    win = None
+    for line in b"".join(text).decode("latin-1").splitlines():
+        f = line.split("\t")
+        if f[0] == "S" and len(f) >= 8:
+            w, h = int(f[4]), int(f[5])
+            screens.append({"addr": f[1], "title": f[7], "left": int(f[2]),
+                            "top": int(f[3]), "width": w, "height": h,
+                            "depth": int(f[6]), "row_scale": row_scale(w, h),
+                            "front": not screens, "windows": []})
+            win = None
+        elif f[0] == "W" and len(f) >= 13 and screens:
+            k = screens[-1]["row_scale"]
+            win = {"addr": f[1], "title": f[12], "task": f[11],
+                   "left": int(f[2]), "top": int(f[3]) * k,
+                   "width": int(f[4]), "height": int(f[5]) * k,
+                   "active": "a" in f[10], "backdrop": "b" in f[10],
+                   "gadgets": [], "menus": []}
+            screens[-1]["windows"].append(win)
+        elif f[0] == "G" and len(f) >= 12 and win is not None:
+            k = screens[-1]["row_scale"]
+            win["gadgets"].append({
+                "addr": f[1], "kind": f[6], "label": f[10],
+                "value": f[11], "class": "" if f[9] == "-" else f[9],
+                "id": int(f[8]),
+                "x": win["left"] + int(f[2]), "y": win["top"] + int(f[3]) * k,
+                "width": int(f[4]), "height": int(f[5]) * k,
+                "disabled": "d" in f[7], "selected": "s" in f[7]})
+        elif f[0] == "M" and len(f) >= 5 and win is not None:
+            win["menus"].append({
+                "code": int(f[1]), "path": f[4],
+                "key": "" if f[3] == "-" else f[3],
+                "disabled": "d" in f[2], "checkable": "c" in f[2],
+                "checked": "x" in f[2], "bar": "b" in f[2]})
+    return screens
+
+
+def ui_windows(screens, title=None):
+    """(screen, window) pairs to search, front first. With a title: the
+    windows whose title contains it, on any screen listed."""
+    out = []
+    for sc in screens:
+        for w in sc["windows"]:
+            if title is None or ui_norm(title) in ui_norm(w["title"]):
+                out.append((sc, w))
+    return out
+
+
+def ui_match(name, items, key):
+    """Items whose key matches NAME: exact first, then starts-with, then
+    contains. Returns the best non-empty tier."""
+    n = ui_norm(name)
+    tiers = ([], [], [])
+    for it in items:
+        v = ui_norm(key(it))
+        if not v:
+            continue
+        if v == n:
+            tiers[0].append(it)
+        elif v.startswith(n):
+            tiers[1].append(it)
+        elif n in v:
+            tiers[2].append(it)
+    for t in tiers:
+        if t:
+            return t
+    return []
+
+
+def find_gadget(screens, label, window=None, kind=None, nth=None, gid=None):
+    """(screen, window, gadget) for LABEL. A system kind name (close,
+    depth, zoom, size, drag) finds that border gadget. gid: the gadget
+    whose GadgetID is that (with or without a label). The frontmost
+    window with a match wins; two matches there need --nth."""
+    pairs = ui_windows(screens, window)
+    if not pairs:
+        raise WasabiError("no window titled %r" % window if window
+                          else "no windows on the front screen")
+    for sc, w in pairs:
+        # Plain text (an MUI label) is never what is meant by a click.
+        gads = [g for g in w["gadgets"] if (g["kind"] == kind if kind
+                                            else g["kind"] != "label")]
+        if gid is not None:
+            gads = [g for g in gads if g["id"] == gid and g["kind"] != "row"]
+        if not label and (kind or gid is not None):  # "the string gadget"
+            hits = gads
+        elif ui_norm(label) in SYSTEM_KINDS:
+            hits = [g for g in gads if g["kind"] == ui_norm(label)]
+        else:
+            hits = ui_match(label, gads, lambda g: g["label"])
+        if not hits:
+            continue
+        if nth is not None:
+            if not 1 <= nth <= len(hits):
+                raise WasabiError("--nth %d: there are %d matches"
+                                  % (nth, len(hits)))
+            return sc, w, hits[nth - 1]
+        if len(hits) > 1:
+            raise WasabiError(
+                "%d gadgets match %r in \"%s\": %s - say which with --nth N"
+                % (len(hits), label, w["title"],
+                   ", ".join('"%s" (%s at %d,%d)' % (g["label"], g["kind"],
+                                                     g["x"], g["y"])
+                             for g in hits[:8])))
+        return sc, w, hits[0]
+    what = "id %d" % gid if gid is not None and not label else \
+        repr(label or kind)
+    raise WasabiError("no gadget %s%s - 'wasabi ui list' shows what there is"
+                      % (what, " in a window titled %r" % window
+                         if window else " on the front screen"))
+
+
+def covered(sc, w, x, y):
+    """Is (x, y) inside a window in front of W on its screen?"""
+    for other in sc["windows"]:
+        if other is w:
+            return False
+        if (other["left"] <= x < other["left"] + other["width"] and
+                other["top"] <= y < other["top"] + other["height"]):
+            return True
+    return False
+
+
+def ui_front(conn, w):
+    conn.send(UIACT, struct.pack(">III", 2, int(w["addr"], 16), 0))
+    conn.expect_ok()
+    time.sleep(0.3)                     # Intuition does it in its own time
+
+
+def ui_click(conn, label, window=None, kind=None, nth=None, double=False,
+             gid=None):
+    """Click a gadget by name (or GadgetID). Brings its window (and
+    screen) to the front first when something would be in the way.
+    Returns (window, gadget)."""
+    screens = read_ui(conn, every_screen=window is not None)
+    sc, w, g = find_gadget(screens, label, window, kind, nth, gid)
+    if g["disabled"]:
+        raise WasabiError("\"%s\" is disabled (ghosted)" % g["label"])
+    if g["kind"] == "row" and not g["height"]:
+        raise WasabiError("the row \"%s\" is not in view - scroll the list "
+                          "first" % g["label"])
+    x, y = g["x"] + g["width"] // 2, g["y"] + g["height"] // 2
+    if not sc["front"] or covered(sc, w, x, y):
+        ui_front(conn, w)
+    send_mouse(conn, 1, x, y, 0, 2 if double else 1)
+    return w, g
+
+
+def ui_set(conn, label, text, window=None, kind=None, nth=None, gid=None,
+           enter=True):
+    """Fill a text field: click it, clear it (Right Amiga+X), type, and
+    Return so the program hears GADGETUP, as from a person."""
+    w, g = ui_click(conn, label, window, kind, nth, gid=gid)
+    if g["kind"] not in ("string", "integer", "custom", "cycle"):
+        raise WasabiError('"%s" is a %s, not a text field'
+                          % (g["label"], g["kind"]))
+    send_keys(conn, key_combo_events("ramiga+x"))
+    send_text(conn, text + ("\r" if enter else ""))
+    return w, g
+
+
+def find_menu(screens, path, window=None):
+    """(window, item) for PATH ('Project/Save As'). Without a window:
+    the active window, else the frontmost one that has menus."""
+    pairs = ui_windows(screens, window)
+    if window is None:
+        pairs.sort(key=lambda p: not p[1]["active"])
+    pairs = [p for p in pairs if p[1]["menus"]]
+    if not pairs:
+        raise WasabiError("no window with menus%s"
+                          % (" titled %r" % window if window else
+                             " on the front screen"))
+    want = [s for s in path.split("/") if s.strip()]
+    w = pairs[0][1]
+    items = [m for m in w["menus"] if not m["bar"]]
+    if len(want) == 1:                  # just "Quit": any item named so
+        hits = ui_match(want[0], items, lambda m: m["path"].split("/")[-1])
+        if len(hits) == 1:
+            return w, hits[0]
+    for depth, seg in enumerate(want):
+        n = ui_norm(seg)
+        segs = lambda m: m["path"].split("/")
+        level = [m for m in items if len(segs(m)) > depth]
+        pick = [m for m in level if ui_norm(segs(m)[depth]) == n] or \
+               [m for m in level if ui_norm(segs(m)[depth]).startswith(n)] or \
+               [m for m in level if n in ui_norm(segs(m)[depth])]
+        items = pick
+    items = [m for m in items if len(m["path"].split("/")) == len(want)] \
+        or items
+    if not items:
+        raise WasabiError("no menu item %r in \"%s\" - 'wasabi ui menus' "
+                          "lists them" % (path, w["title"]))
+    if len(items) > 1:
+        raise WasabiError("%r matches %d menu items: %s" % (
+            path, len(items), ", ".join(m["path"] for m in items[:8])))
+    return w, items[0]
+
+
+def ui_menu(conn, path, window=None):
+    screens = read_ui(conn, every_screen=window is not None)
+    w, m = find_menu(screens, path, window)
+    if m["disabled"]:
+        raise WasabiError("\"%s\" is disabled (ghosted)" % m["path"])
+    conn.send(UIACT, struct.pack(">III", 1, int(w["addr"], 16), m["code"]))
+    conn.expect_ok()
+    return w, m
+
+
+def cmd_ui(conn, args):
+    """Gadgets and menus by name: list them, click one, pick a menu item.
+
+    Gadgets are clicked with the real mouse, at their middle, so the
+    program sees exactly what a person's click gives it. A menu item is
+    picked by handing the window the message Intuition would send - no
+    mouse, so it works whatever the menu looks like (pop-up or bar).
+    """
+    if args.action == "list" or args.action == "menus":
+        screens = read_ui(conn, every_screen=args.all_screens or
+                          args.window is not None)
+        native_out(screens)
+        pairs = ui_windows(screens, args.window)
+        if args.json:
+            emit_json(screens if args.window is None else
+                      [w for _, w in pairs])
+            return
+        for sc, w in pairs:
+            print('window "%s"  at %d,%d  %dx%d  task %s%s'
+                  % (w["title"], w["left"], w["top"], w["width"],
+                     w["height"], w["task"],
+                     "  [active]" if w["active"] else ""))
+            if args.action == "list":
+                for g in w["gadgets"]:
+                    if g["kind"] == "row":
+                        print('      row %-4s %-24s %s%s'
+                              % (g["value"], '"%s"' % g["label"],
+                                 "at %d,%d %dx%d" % (g["x"], g["y"],
+                                                     g["width"], g["height"])
+                                 if g["height"] else "(not in view)",
+                                 "  [selected]" if g["selected"] else ""))
+                        continue
+                    flags = [n for n in ("disabled", "selected") if g[n]]
+                    print('  %-8s %-24s id %-4d at %d,%d %dx%d%s%s%s'
+                          % (g["kind"], '"%s"' % g["label"] if g["label"]
+                             else "-", g["id"], g["x"], g["y"], g["width"],
+                             g["height"],
+                             "  (%s)" % g["class"] if g["class"] else "",
+                             '  value "%s"' % g["value"] if g["value"] and
+                             g["kind"] != "prop" else "",
+                             "  [%s]" % ", ".join(flags) if flags else ""))
+            for m in w["menus"]:
+                if m["bar"]:
+                    continue
+                flags = [n for n in ("disabled", "checked") if m[n]]
+                print('  menu     %-32s%s%s'
+                      % (m["path"], "  Amiga+%s" % m["key"] if m["key"]
+                         else "", "  [%s]" % ", ".join(flags) if flags
+                         else ""))
+        return
+    if args.action == "front":
+        if not args.name:
+            raise WasabiError("ui front needs a window title")
+        pairs = ui_windows(read_ui(conn, every_screen=True), args.name)
+        if not pairs:
+            raise WasabiError("no window titled %r" % args.name)
+        ui_front(conn, pairs[0][1])
+        print('"%s" is in front and active' % pairs[0][1]["title"])
+        return
+    by_kind = (args.kind or args.id is not None) and \
+        args.action in ("click", "set")
+    if args.id is not None and args.action == "set" and args.text is None:
+        args.name, args.text = None, args.name   # ui set --id 4 TEXT
+    if not args.name and not by_kind:
+        raise WasabiError("ui %s needs a name" % args.action)
+    if args.action == "click":
+        w, g = ui_click(conn, args.name, args.window, args.kind, args.nth,
+                        args.double, gid=args.id)
+        print('clicked %s "%s" in "%s"' % (g["kind"], g["label"] or "-",
+                                           w["title"]))
+    elif args.action == "set":
+        if args.text is None:
+            raise WasabiError("ui set needs the text: "
+                              "wasabi ui set NAME TEXT")
+        w, g = ui_set(conn, args.name, args.text, args.window, args.kind,
+                      args.nth, args.id, enter=not args.no_enter)
+        print('set "%s" in "%s"' % (g["label"] or g["kind"], w["title"]))
+    elif args.action == "menu":
+        w, m = ui_menu(conn, args.name, args.window)
+        print('picked "%s" in "%s"' % (m["path"], w["title"]))
+
+
+# --- ARexx --------------------------------------------------------------
+
+
+def arexx(conn, port, command, timeout=30):
+    """Send COMMAND to the ARexx port PORT; (rc, rc2, result).
+
+    rc 0 is success and result is what the host set as RESULT; otherwise
+    rc is the host's error level (5 warn, 10 error, 20 failure) and rc2
+    its secondary code."""
+    if conn.caps and "arexx" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) has no ARexx - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    conn.send(AREXX, struct.pack(">I", int(timeout)) + pack_str(port) +
+              pack_str(command))
+    conn.sock.settimeout(max(SILENCE, timeout + 10))
+    parts = []
+    drain_to_end(conn, parts.append)
+    data = b"".join(parts)
+    if len(data) < 8:
+        raise WasabiError("short ARexx answer")
+    rc, rc2 = struct.unpack(">iI", data[:8])
+    return rc, rc2, data[8:].decode("latin-1")
+
+
+def rexx_ports(conn):
+    if conn.caps and "arexx" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot list ports - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    conn.send(PORTS)
+    parts = []
+    drain_to_end(conn, parts.append)
+    return sorted(set(b"".join(parts).decode("latin-1").splitlines()),
+                  key=str.lower)
+
+
+def cmd_mcp(args):
+    """The MCP server (wasabi_mcp.py) - the same one, so a one-file
+    build carries it too."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import wasabi_mcp
+    sys.argv = [sys.argv[0]]             # no --probe
+    return wasabi_mcp.main()
+
+
+def cmd_arexx(conn, args):
+    """Talk to an Amiga program through its ARexx port: wasabi arexx
+    PORT COMMAND. The exit code is the command's own rc."""
+    if args.ports or not args.rexxport:
+        ports = rexx_ports(conn)
+        if args.json:
+            emit_json(ports)
+        else:
+            print("\n".join(ports))
+        return 0
+    if not args.command:
+        raise WasabiError("wasabi arexx PORT COMMAND - what to send?")
+    if args.rexxport in ("REXX", "AREXX"):
+        # ARexx's own ports take a macro *name*, not a program, and
+        # AREXX does not even wait for it: run the text with RX instead,
+        # so its output and its rc come back.
+        out = [] if args.json else None
+        rc = rexx_program(conn, " ".join(args.command),
+                          sink=out.append if out is not None else None,
+                          max_time=args.timeout)
+        if args.json:
+            emit_json({"rc": rc, "rc2": 0, "result": "".join(out)})
+        return rc if 0 <= rc < 256 else 1
+    rc, rc2, result = arexx(conn, args.rexxport, " ".join(args.command),
+                            args.timeout)
+    if args.json:
+        emit_json({"rc": rc, "rc2": rc2, "result": result})
+    elif rc == 0:
+        if result:
+            print(result)
+    else:
+        print("wasabi: %s answered rc %d (%d)" % (args.rexxport, rc, rc2),
+              file=sys.stderr)
+    return rc if 0 <= rc < 256 else 1
+
+
+# --- input batches: a gesture timed by the Amiga ------------------------
+
+INPUTS_MAX_TICKS = 250                   # what the daemon allows (5 s)
+
+
+def input_events(steps, gap=1):
+    """Turn steps into INPUTS records [kind, button, wait, a, b, x, y].
+
+    A step is a string (or a list of words):
+      key COMBO...      raw keys by name: 'key ramiga+w', 'key a b c'
+      type TEXT         characters through the Amiga's keymap
+      move X Y          the pointer
+      click|double|down|up [X Y] [left|right|middle]
+      wait N            N more ticks (1/50 s) after the event before it
+    gap: ticks between one event and the next (0 = back to back)."""
+    out = []
+    for step in steps:
+        words = step.split() if isinstance(step, str) else list(step)
+        if not words:
+            continue
+        verb, rest = words[0].lower(), words[1:]
+        if verb == "wait":
+            if len(rest) != 1 or not rest[0].isdigit():
+                raise WasabiError("wait N - a number of ticks (1/50 s)")
+            if not out:
+                raise WasabiError("a batch cannot start with wait")
+            out[-1][2] += int(rest[0])
+        elif verb == "key":
+            if not rest:
+                raise WasabiError("key needs a key name, e.g. key ramiga+w")
+            for combo in rest:
+                for code, qual in key_combo_events(combo):
+                    out.append([0, 0, gap, code, qual, 0, 0])
+        elif verb == "type":
+            text = step.split(None, 1)[1] if isinstance(step, str) and \
+                len(words) > 1 else " ".join(rest)
+            for c in latin1(text.replace("\n", "\r")):
+                out.append([1, 0, gap, c, 0, 0, 0])
+        elif verb in ("move", "click", "double", "doubleclick", "down",
+                      "up"):
+            button = 0
+            if rest and rest[-1].lower() in BUTTONS:
+                button = BUTTONS[rest.pop().lower()]
+            if len(rest) not in (0, 2):
+                raise WasabiError("%s [X Y] - two numbers or none" % verb)
+            try:
+                x, y = (int(rest[0]), int(rest[1])) if rest else \
+                    (NOPOS, NOPOS)
+            except ValueError:
+                raise WasabiError("%s X Y - numbers, not %r"
+                                  % (verb, " ".join(rest)))
+            if verb == "move" and not rest:
+                raise WasabiError("move needs X and Y")
+            action = MOUSE_ACTIONS["doubleclick" if verb == "double"
+                                   else verb]
+            count = 2 if verb.startswith("double") else \
+                1 if action == 1 else 0
+            out.append([2, button, gap, action, count, x, y])
+        else:
+            raise WasabiError(
+                "unknown step %r - key, type, move, click, double, down, "
+                "up or wait" % verb)
+    if not out:
+        raise WasabiError("nothing to send")
+    out[-1][2] = max(0, out[-1][2] - gap)  # no gap after the last event
+    return out
+
+
+def send_inputs(conn, records, native_scale=1):
+    """Play INPUTS records on the Amiga; returns when the last is done.
+    native_scale: the row doubling to apply to mouse y (--native)."""
+    if conn.caps and "inputs" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot play a timed batch - update it with "
+            "'wasabi update wasabid' (0.10b4 or newer)" % conn.banner)
+    if len(records) > 1024:
+        raise WasabiError("at most 1024 events per batch (this has %d)"
+                          % len(records))
+    ticks = sum(r[2] for r in records)
+    if ticks > INPUTS_MAX_TICKS:
+        raise WasabiError("the waits add up to %d ticks (%.1f s); a batch "
+                          "may take 5 s - split it" % (ticks, ticks / 50.0))
+    blob = b""
+    for kind, button, wait, a, b, x, y in records:
+        if kind == 2 and native_scale != 1 and y != NOPOS:
+            y *= native_scale
+        blob += struct.pack(">BBHHHhh", kind, button, wait, a, b, x, y)
+    conn.send(INPUTS, blob)
+    old = conn.sock.gettimeout()
+    conn.sock.settimeout(max(SILENCE, ticks / 50.0 + 10))
+    try:
+        conn.expect_ok()
+    finally:
+        conn.sock.settimeout(old)
+
+
+def cmd_input(conn, args):
+    """A batch of key and mouse events in one request, played by the
+    Amiga with fixed gaps (ticks of 1/50 s) between them."""
+    steps = list(args.steps)
+    if args.file:
+        fh = sys.stdin if args.file == "-" else open(args.file)
+        with fh:
+            steps += [l.split("#", 1)[0].strip() if not
+                      l.lstrip().lower().startswith("type ") else
+                      l.rstrip("\n") for l in fh]
+        steps = [l for l in steps if l.strip()]
+    records = input_events(steps, args.gap)
+    k = 1
+    if NATIVE and any(r[0] == 2 and r[6] != NOPOS for r in records):
+        screens, _ = list_windows(conn)
+        k = screens[0]["row_scale"] if screens else 1
+    send_inputs(conn, records, k)
+    ticks = sum(r[2] for r in records)
+    print("played %d event(s) over %.2f s" % (len(records), ticks / 50.0),
+          file=sys.stderr)
+
+
+# --- ARexx programs -------------------------------------------------------
+
+def rexx_program(conn, program, sink=None, max_time=None):
+    """Run an ARexx program (its text) with RX and return its rc; what it
+    SAYs streams to sink (or stdout). The program goes to T: and is
+    deleted again."""
+    name = "T:wasabi-%08x.rexx" % random.getrandbits(32)
+    if not program.lstrip().startswith("/*"):
+        program = "/* wasabi */\n" + program   # ARexx wants the comment
+    put_bytes(conn, latin1(program.replace("\r\n", "\n")), name)
+    out = sink or (lambda t: (sys.stdout.write(t), sys.stdout.flush()))
+    held = {"line": None, "part": ""}    # the last whole line waits
+
+    def lines(text):
+        *done, held["part"] = (held["part"] + text).split("\n")
+        for line in done:
+            if held["line"] is not None:
+                out(held["line"] + "\n")
+            held["line"] = line
+    try:
+        rc = do_run(conn, "SYS:Rexxc/RX " + name, merge=True, sink=lines,
+                    max_time=max_time)
+        # RX itself says "Command returned N" after a program that
+        # returns non-zero; the rc says it already.
+        last = held["line"]
+        if last is not None and not re.fullmatch(r"Command returned -?\d+",
+                                                 last.strip()):
+            out(last + "\n")
+        if held["part"]:
+            out(held["part"])
+        return rc
+    finally:
+        try:
+            conn.send(DEL, pack_str(name))
+            conn.expect_ok()
+        except (OSError, WasabiError):
+            pass
+
+
+def cmd_rexx(conn, args):
+    """Run an ARexx program: its output comes back, the exit code is
+    its rc. The program is the arguments, a file, or - for stdin."""
+    if args.file:
+        if args.file == "-":
+            program = sys.stdin.read()
+        else:
+            with open(args.file, encoding="latin-1") as fh:
+                program = fh.read()
+        if args.program:
+            raise WasabiError("a program, or --file, not both")
+    elif args.program:
+        program = " ".join(args.program)
+    else:
+        raise WasabiError("wasabi rexx 'say 1+1' - which program?")
+    out = [] if args.json else None
+    rc = rexx_program(conn, program, sink=out.append if out is not None
+                      else None, max_time=args.max_time)
+    if args.json:
+        emit_json({"rc": rc, "output": "".join(out)})
+    return rc if 0 <= rc < 256 else 1
+
+
+def cmd_screen(conn, args):
+    """List the open screens, and optionally reorder them.
+
+    Cycling is ScreenToBack() on the frontmost - exactly what Amiga+M
+    does - so flipping screens from here needs no synthesised keystrokes.
+    """
+    if conn.caps and "screen" not in conn.caps:
+        raise WasabiError(
+            "this daemon (%s) cannot list screens - update it with "
+            "'wasabi update wasabid'" % conn.banner)
+    flags = 1 if args.cycle else 0
+    conn.send(SCREEN, struct.pack(">I", flags) + pack_str(args.to_front or ""))
+    text = []
+    drain_to_end(conn, text.append)
+    rows = []
+    for line in b"".join(text).decode("latin-1").splitlines():
+        parts = line.split(" ", 4)
+        if len(parts) >= 4:
+            rows.append(parts + [""] * (5 - len(parts)))
+    if args.json:
+        emit_json([{"addr": a, "width": int(w), "height": int(h),
+                    "depth": int(d), "title": t, "front": i == 0}
+                   for i, (a, w, h, d, t) in enumerate(rows)])
+        return
+    print("%-10s %-11s %5s  %s" % ("ADDR", "SIZE", "DEPTH", "TITLE"))
+    for i, (addr, w, h, d, title) in enumerate(rows):
+        print("%-10s %-11s %5s  %s%s"
+              % (addr, "%sx%s" % (w, h), d, title,
+                 "   <- front" if i == 0 else ""))
+    if args.cycle:
+        print("cycled - the front screen went to the back", file=sys.stderr)
+    elif args.to_front:
+        print("brought %r to the front" % args.to_front, file=sys.stderr)
+
+
+PSF_FREE = 1                    # PS flags word, bit 0: include headroom
+
+# When to say a task is running out of stack.
+#
+# The first attempt was a flat 1024 bytes, and the A1200 rejected it
+# immediately: trackdisk.device, card.resource and carddisk.device all
+# live on 512-byte stacks and sit at ~300 free, so every single ps
+# warned about three idle system tasks that were nowhere near trouble.
+# "Close to the edge" is a proportion, not a byte count - 300 of 512 is
+# fine, 300 of 131072 is a task about to take the machine down.
+#
+# The absolute floor stays as a backstop for the genuinely tiny, where
+# any proportion is misleading and one nested call is the whole margin.
+STACK_TIGHT_PCT = 15
+STACK_TIGHT_ABS = 256
+
+
+def stack_tight(free, cap):
+    if free < 0 or cap <= 0:
+        return False                # not measured; not a claim either way
+    return free * 100 < cap * STACK_TIGHT_PCT or free < STACK_TIGHT_ABS
+
+
+def cmd_base(cmd):
+    """'SYS:Utilities/Clock' -> 'Clock': a Shell records a command as it
+    was typed, path and all, but people name it by its last part."""
+    return re.split(r"[:/]", cmd)[-1]
+
+
+def ps_rows(conn, pattern=None):
+    """The task list as tuples: (addr, kind, pri, state, stack, free,
+    cli, name, cmd), sorted processes-first by CLI number then name."""
+    # Ask for headroom only when the daemon says it understands the
+    # flags word. A daemon that predates it ignores the payload and
+    # sends the seven-field line, which is what we would then parse; a
+    # daemon whose caps we cannot read at all (pre-caps) is not
+    # second-guessed, same rule as everywhere else in this client.
+    want_free = "psfree" in conn.caps
+    conn.send(PS, struct.pack(">I", PSF_FREE if want_free else 0))
+    text = []
+    drain_to_end(conn, lambda b: text.append(b))
+    rx = amiga_pattern(pattern) if pattern else None
+    nfield = 8 if want_free else 7
+    rows = []
+    for line in b"".join(text).decode("latin-1").splitlines():
+        parts = line.split(" ", nfield - 1)
+        if len(parts) < nfield:
+            continue
+        if want_free:
+            addr, kind, pri, state, stack, free, cli, rest = parts
+        else:
+            addr, kind, pri, state, stack, cli, rest = parts
+            free = "-1"
+        name, _, cmd = rest.partition("\t")
+        if rx and not (rx.match(name) or (cmd and (
+                rx.match(cmd) or rx.match(cmd_base(cmd))))):
+            continue
+        rows.append((addr, kind, int(pri), state, int(stack), int(free),
+                     int(cli), name, cmd))
+    rows.sort(key=lambda r: (r[1] != "p", r[6] if r[6] >= 0 else 999,
+                             r[7].lower()))
+    return rows, want_free
+
+
+def cmd_ps(conn, args):
+    rows, want_free = ps_rows(conn, args.pattern)
+    if args.json:
+        emit_json([{"addr": r[0], "kind": "process" if r[1] == "p"
+                    else "task", "pri": r[2], "state": r[3],
+                    "stack": r[4], "free": r[5] if r[5] >= 0 else None,
+                    "cli": r[6] if r[6] >= 0 else None, "name": r[7],
+                    "command": r[8]} for r in rows])
+        return
+
+    head = "%-10s %-4s %4s %-6s %7s" % ("ADDR", "KIND", "PRI", "STATE",
+                                        "STACK")
+    if want_free:
+        head += " %7s" % "FREE"
+    print(head + " %4s  %s" % ("CLI", "NAME"))
+
+    for addr, kind, pri, state, stack, free, cli, name, cmd in rows:
+        label = name
+        if cmd and cmd.lower() != name.lower():
+            label += " (%s)" % cmd
+        row = "%-10s %-4s %4d %-6s %7d" % (
+            addr, "proc" if kind == "p" else "task", pri, state, stack)
+        if want_free:
+            # '-' where the daemon could not measure honestly: a task
+            # that swapped stacks, and the running task on a daemon too
+            # old to sample its own sp instead of a stale tc_SPReg.
+            row += " %7s" % (free if free >= 0 else "-")
+        print(row + " %4s  %s" % (cli if cli >= 0 else "-", label))
+
+    print("%d tasks" % len(rows), file=sys.stderr)
+    # Headroom is the number that predicts a crash, so say something
+    # when one is close rather than leaving it to be spotted in a column.
+    tight = [r for r in rows if stack_tight(r[5], r[4])]
+    if tight:
+        tight.sort(key=lambda r: r[5] / float(r[4]))
+        print("wasabi: low stack - %s" % ", ".join(
+            "%s has %d of %d left (%.0f%%)"
+            % (r[7] or r[8], r[5], r[4], 100.0 * r[5] / r[4])
+            for r in tight[:3]), file=sys.stderr)
+
+
+def slot_rows(conn):
+    """The run slots in use: (slot, state, seconds, attached, command)."""
+    conn.send(SLOTS)
+    text = []
+    drain_to_end(conn, text.append)
+    rows = []
+    for line in b"".join(text).decode("latin-1").splitlines():
+        parts = line.split(" ", 4)
+        if len(parts) == 5:
+            rows.append((int(parts[0]), parts[1], int(parts[2]),
+                         parts[3] == "1", parts[4]))
+    return rows
+
+
+def cmd_slots(conn, args):
+    """What each run slot is running, for how long, and whether anyone
+    is still reading its output. 'stuck' is a command let go of with
+    'free' that has not ended: it holds no slot, only memory."""
+    rows = slot_rows(conn)
+    if args.json:
+        emit_json([{"slot": r[0], "state": r[1], "seconds": r[2],
+                    "attached": r[3], "command": r[4]} for r in rows])
+        return
+    if not rows:
+        print("all run slots are free", file=sys.stderr)
+        return
+    print("%-4s %-8s %7s  %-8s %s" % ("SLOT", "STATE", "TIME", "OUTPUT",
+                                       "COMMAND"))
+    for slot, state, secs, attached, cmd in rows:
+        print("%-4d %-8s %6ds  %-8s %s" % (
+            slot, state, secs, "read" if attached else "-", cmd))
+
+
+def cmd_free(conn, args):
+    """Stop a slot's command with Ctrl-C; if it will not stop within
+    three seconds, let go of the slot anyway (the command is left
+    running on the Amiga, but the slot can be used again)."""
+    flags = FREE_BREAK_ONLY if args.ctrl_c_only else 0
+    conn.send(FREE, struct.pack(">II", args.slot, flags))
+    text = []
+    drain_to_end(conn, text.append)
+    what = b"".join(text).decode("latin-1").strip()
+    print({"stopped": "slot %d: the command stopped" % args.slot,
+           "freed": "slot %d is free again; the command ignored Ctrl-C "
+                    "and is left running until it ends ('wasabi slots' "
+                    "shows it as stuck)" % args.slot,
+           "asked": "slot %d: sent Ctrl-C" % args.slot}.get(
+               what, "slot %d: %s" % (args.slot, what)), file=sys.stderr)
+
+
+def cmd_kill(conn, args):
+    """Ctrl-C (or with --force, RemTask) a task by name or 0x address.
+
+    A name is resolved here first, against the task name, the command
+    as typed, and the command's last part - so 'Clock' finds a Clock
+    started as 'SYS:Utilities/Clock'. The daemon is then sent the
+    address, and re-checks that the task is still alive before it acts.
+    """
+    target = args.target
+    if not target.lower().startswith("0x"):
+        t = target.lower()
+        rows, _ = ps_rows(conn)
+        hits = [r for r in rows if t in (r[7].lower(), r[8].lower(),
+                                         cmd_base(r[8]).lower())]
+        if not hits:
+            raise WasabiError("no task or process called %s - "
+                              "'wasabi ps' lists them" % target)
+        if len(hits) > 1:
+            raise WasabiError(
+                "%d tasks match %s - name one by its address: %s"
+                % (len(hits), target, ", ".join(
+                    "%s (%s)" % (r[0], r[8] or r[7]) for r in hits)))
+        target = hits[0][0]
+        label = "%s (%s)" % (args.target, target)
+    else:
+        label = target
+    flags = 1 if args.force else 0
+    conn.send(KILL, struct.pack(">I", flags) + pack_str(target))
+    conn.expect_ok()
+    print("%s %s" % ("removed" if args.force else "sent Ctrl-C to",
+                     label), file=sys.stderr)
+
+
+def do_reboot(conn, cold=False):
+    conn.send(REBOOT, struct.pack(">I", 1 if cold else 0))
+    try:
+        conn.expect_ok()
+    except WasabiError as exc:
+        # The machine may go down before the reply lands; a real
+        # refusal, though, deserves to be heard.
+        if "connection closed" not in str(exc):
+            raise
+
+
+def cmd_reboot(conn, args):
+    if not args.yes:
+        raise WasabiError(
+            "this reboots the Amiga - whatever is open there is lost. "
+            "Pass --yes if you mean it")
+    do_reboot(conn, cold=args.cold)
+    if args.wait:
+        conn.close()
+        print("rebooting - waiting for the Amiga to answer again...",
+              file=sys.stderr)
+        # Give it time to actually go down first, or the old daemon
+        # answers the first probe and "it is back" means nothing.
+        time.sleep(5.0)
+        args.timeout = args.wait
+        return cmd_wait_up(args)
+    print("reboot sent", file=sys.stderr)
+
+
+def do_restart(conn, force=False):
+    conn.send(RESTART, struct.pack(">I", 1 if force else 0))
+    try:
+        conn.expect_ok()
+    except WasabiError as exc:
+        # The daemon exits right after acking; a refusal is different.
+        if "connection closed" not in str(exc):
+            raise
+
+
+def cmd_restart(conn, args):
+    do_restart(conn, force=args.force)
+    print("restart sent - the daemon is reloading itself", file=sys.stderr)
+
+
+def cmd_del(conn, args):
+    check_system_place(args, args.path, "delete")
+    conn.send(DEL, pack_str(args.path))
+    conn.expect_ok()
+
+
+def cmd_mkdir(conn, args):
+    conn.send(MKDIR, pack_str(args.path))
+    conn.expect_ok()
+
+
+# --- config and dispatch ----------------------------------------------
+
+
+DISCOVERY_PROBE = b"WASABI?1\n"
+
+
+def _xdg(env, fallback):
+    """XDG base dir: the env var if set, else the conventional default.
+    Also what lets the test suite keep its state out of the real one."""
+    return os.environ.get(env) or os.path.expanduser(fallback)
+
+
+CACHE = os.path.join(_xdg("XDG_CACHE_HOME", "~/.cache"), "wasabi/last-host")
+SEEN_REFUSED = os.path.join(_xdg("XDG_CACHE_HOME", "~/.cache"),
+                            "wasabi/refused-%s")
+
+
+def warn_if_refusals_grew(conn, host):
+    """Say something only when the count has gone up since last time.
+
+    A standing "673 refused connections" on every command is wallpaper
+    within a day; a number that moves is a signal. So remember what we
+    last saw for this host and speak up only on the difference.
+    """
+    if not conn.refused:
+        return
+    path = SEEN_REFUSED % host.replace("/", "_")
+    try:
+        with open(path) as fh:
+            before = int(fh.read().strip())
+    except (OSError, ValueError):
+        before = 0
+    if conn.refused > before:
+        new = conn.refused - before
+        print("wasabi: %d connection(s) refused as off-LAN since you last "
+              "looked (%d in total) - 'wasabi debug' shows them as they "
+              "happen" % (new, conn.refused), file=sys.stderr)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("%d\n" % conn.refused)
+    except OSError:
+        pass
+
+
+def local_ipv4s():
+    """Every local IPv4 address and netmask, via the interface list.
+
+    The ioctl numbers are per-OS; the ifreq layout happily is not - a
+    sockaddr_in puts the address at bytes 20:24 of the request on Linux
+    (2-byte family, 2-byte port) and on the BSDs/macOS (1-byte length,
+    1-byte family, 2-byte port) alike. Windows has no fcntl at all;
+    there this returns nothing and discovery degrades to the plain
+    broadcast, which still works - as do the cache and --host.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return _local_ipv4s_portable()
+    import array
+    if sys.platform.startswith("linux"):
+        SIOCGIFADDR, SIOCGIFNETMASK = 0x8915, 0x891B
+    else:
+        # Darwin inherited these numbers from BSD, so macOS, FreeBSD
+        # and OpenBSD all agree. NetBSD's larger ifreq encodes a
+        # different number, so there the ioctl fails clean and the
+        # sweep degrades to the broadcast fallback, as before.
+        SIOCGIFADDR, SIOCGIFNETMASK = 0xC0206921, 0xC0206925
+    out = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _idx, name in socket.if_nameindex():
+            if name in ("lo", "lo0"):
+                continue
+            # ioctl() with a mutable buffer returns an int and writes the
+            # answer INTO the buffer - read ifreq, never the return value.
+            ifreq = array.array("B", name.encode()[:15].ljust(40, b"\0"))
+            try:
+                fcntl.ioctl(sock.fileno(), SIOCGIFADDR, ifreq)
+                ip = ".".join(str(b) for b in ifreq[20:24])
+                fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, ifreq)
+                nm = ".".join(str(b) for b in ifreq[20:24])
+            except OSError:
+                continue
+            if ip != "0.0.0.0":
+                out.append((ip, nm))
+    finally:
+        sock.close()
+    return out
+
+
+def _local_ipv4s_portable():
+    """Where there is no ioctl (Windows): this computer's addresses from
+    its host name and from the route a UDP socket would take, each taken
+    as a /24 - home networks nearly always are, and the sweep is only a
+    fallback for broadcast that does not cross Wi-Fi to wired."""
+    ips = set()
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))    # sends nothing
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    return [(ip, "255.255.255.0") for ip in sorted(ips)
+            if not ip.startswith(("127.", "169.254.", "0."))]
+
+
+def _to_int(dotted):
+    a, b, c, d = (int(x) for x in dotted.split("."))
+    return (a << 24) | (b << 16) | (c << 8) | d
+
+
+def _to_str(v):
+    return "%d.%d.%d.%d" % ((v >> 24) & 255, (v >> 16) & 255,
+                            (v >> 8) & 255, v & 255)
+
+
+def _collect(sock, found, deadline):
+    while time.time() < deadline:
+        sock.settimeout(max(deadline - time.time(), 0.01))
+        try:
+            data, addr = sock.recvfrom(1024)
+        except (socket.timeout, OSError):
+            return
+        line = data.decode("latin-1", "replace").strip()
+        if not line.startswith("WASABI!1 "):
+            continue
+        parts = line[9:].split(" ", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            port_ = int(parts[1])
+        except ValueError:
+            continue
+        # Keyed by (ip, port), not ip: two daemons on one host - a trial
+        # instance beside the live one, say - are two answers, not one.
+        found[(addr[0], port_)] = (parts[0],
+                                   parts[2] if len(parts) > 2 else "")
+
+
+LOOPBACK_PORTS = 4     # emulators on this PC: port, port+1, ...
+DISCOVER_TRIES = 3     # a just-restarted Amiga may not answer at once
+
+
+def is_loopback(ip):
+    return ip.startswith("127.")
+
+
+def want_tls(peer_ip):
+    """TLS everywhere but this computer itself; WASABI_TLS=always
+    encrypts there too (the tests use it)."""
+    return os.environ.get("WASABI_TLS") == "always" or \
+        not is_loopback(peer_ip)
+
+
+def discover(timeout=0.5, port=1234, sweep=True):
+    """Find every wasabid on this network.
+
+    Broadcast first. If no real machine answers, sweep the local subnet
+    with unicast probes: a Wi-Fi client talking to a wired Amiga
+    frequently cannot get a broadcast across the bridge, and 254 small
+    UDP packets cost nothing next to failing to find the machine at all.
+
+    "No real machine" counts loopback answers as nothing: an emulator on
+    this PC always answers, and the A1200 often misses the broadcast, so
+    stopping at the first answer would never look for the real Amiga.
+    Loopback is probed on a few ports, one per emulator (wasabid's bare
+    port argument), so two FS-UAEs are two answers.
+    """
+    found = {}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        targets = [("255.255.255.255", port)]
+        targets += [("127.0.0.1", port + i) for i in range(LOOPBACK_PORTS)]
+        locals_ = local_ipv4s()
+        for ip, nm in locals_:
+            bcast = _to_int(ip) | (~_to_int(nm) & 0xFFFFFFFF)
+            targets.append((_to_str(bcast), port))
+        for t in targets:
+            try:
+                sock.sendto(DISCOVERY_PROBE, t)
+            except OSError:
+                pass
+        _collect(sock, found, time.time() + timeout)
+        _fold_own(found, locals_)
+        if not sweep or any(not is_loopback(ip) for ip, _p in found):
+            return found
+
+        for ip, nm in locals_:
+            hosts = (~_to_int(nm) & 0xFFFFFFFF) - 1
+            if hosts <= 0 or hosts > 1022:      # don't sweep a /16
+                continue
+            base = _to_int(ip) & _to_int(nm)
+            # Non-blocking: a blocking sendto() to an address with no ARP
+            # entry stalls until the resolution gives up, and 254 of those
+            # in a row turn a one-second probe into eight.
+            sock.setblocking(False)
+            for h in range(1, hosts + 1):
+                try:
+                    sock.sendto(DISCOVERY_PROBE, (_to_str(base + h), port))
+                except OSError:
+                    pass
+            sock.setblocking(True)
+            _collect(sock, found, time.time() + max(timeout, 1.0))
+        _fold_own(found, locals_)
+    finally:
+        sock.close()
+    return found
+
+
+def _fold_own(found, locals_):
+    """An emulator on this PC answers a broadcast from the PC's own LAN
+    (or Tailscale) address, which looks like a real machine on the
+    network, yet it only listens on loopback. Count it as loopback."""
+    own = {ip for ip, _nm in locals_}
+    for key in [k for k in found if k[0] in own]:
+        val = found.pop(key)
+        found.setdefault(("127.0.0.1", key[1]), val)
+
+
+def cached_host():
+    """(host, port, name) from the last run; name is "" in caches
+    written before the name was kept."""
+    try:
+        with open(CACHE) as fh:
+            parts = fh.read().split()
+        return parts[0], int(parts[1]), (parts[2] if len(parts) > 2 else "")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cache_host(host, port, name=""):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with open(CACHE, "w") as fh:
+            fh.write("%s %d %s\n" % (host, port, name))
+    except OSError:
+        pass
+
+
+def pick_machine(found, want_name=""):
+    """Which of several answers to talk to, or None to make the user pick.
+
+    The machine last used, by name, wins - that is how an Amiga that got
+    a new address after a restart is followed. Then a real machine wins
+    over emulators on this PC, if there is only one: an emulator is
+    reached on purpose, with --host 127.0.0.1.
+    """
+    if len(found) == 1:
+        return next(iter(found))
+    if want_name:
+        named = [k for k, (n, _b) in found.items() if n == want_name]
+        if len(named) == 1:
+            return named[0]
+    real = [k for k in found if not is_loopback(k[0])]
+    if len(real) == 1:
+        return real[0]
+    return None
+
+
+def resolve_target(args):
+    """Work out which Amiga to talk to: --host, then cache, then probe."""
+    if args.host:
+        return args.host, args.port
+    hit = cached_host()
+    want = ""
+    if hit:
+        host, port, want = hit
+        try:
+            socket.create_connection((host, port), timeout=1.0).close()
+            return host, port
+        except OSError:
+            pass  # moved or off - fall through to a fresh probe
+    # A machine that has just restarted may still be bringing its network
+    # up, so one empty probe is not the last word.
+    found = {}
+    for attempt in range(DISCOVER_TRIES):
+        found = discover(port=args.port, timeout=0.5 + attempt * 0.5)
+        if found:
+            break
+    if not found:
+        raise WasabiError(
+            "no wasabid answered on this network.\n"
+            "  Is it running? Try: wasabi --host <ip> ping")
+    key = pick_machine(found, want)
+    if key is None:
+        lines = ["several Amigas answered - pick one with --host:"]
+        for (ip, port), (name, banner) in sorted(found.items()):
+            lines.append("  %-15s :%-5d %s  %s" % (ip, port, name, banner))
+        raise WasabiError("\n".join(lines))
+    others = [k for k in found if k != key]
+    if others:
+        print("wasabi: using %s:%d (%s); also answering: %s - pick with "
+              "--host" % (key[0], key[1], found[key][0],
+                          ", ".join("%s:%d" % k for k in sorted(others))),
+              file=sys.stderr)
+    cache_host(key[0], key[1], found[key][0])
+    return key
+
+
+def cmd_discover(args):
+    found = discover(port=args.port, timeout=1.0)
+    if not found:
+        print("no wasabid found on this network", file=sys.stderr)
+        return 1
+    for (ip, port), (name, banner) in sorted(found.items()):
+        print("%-15s :%-5d %-12s %s" % (ip, port, name, banner))
+    return 0
+
+
+def load_config():
+    cfg = {}
+    path = os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "wasabi/config")
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return cfg
+
+
+JSON_COMMANDS = ("ls", "ps", "screen", "windows", "ping", "run", "wait",
+                 "grab", "health", "slots", "ui", "arexx", "mouse", "rexx")
+
+
+def main(argv=None):
+    global SILENCE
+    if sys.platform == "win32":
+        # A Windows console cannot print every character an Amiga sends.
+        for f in (sys.stdout, sys.stderr):
+            try:
+                f.reconfigure(errors="replace")
+            except (AttributeError, ValueError):
+                pass
+    cfg = load_config()
+    p = argparse.ArgumentParser(
+        prog="wasabi", description="Drive a real Amiga over the network.")
+    p.add_argument("--host", default=os.environ.get(
+        "WASABI_HOST", cfg.get("host")),
+        help="Amiga address; omitted means find it by broadcast")
+    p.add_argument("--port", type=int, default=int(os.environ.get(
+        "WASABI_PORT", cfg.get("port", 1234))))
+    p.add_argument("--key", default=os.environ.get(
+        "WASABI_KEY", cfg.get("key", "")))
+    p.add_argument("--silence", type=float, metavar="SECONDS",
+                   default=float(os.environ.get(
+                       "WASABI_SILENCE", cfg.get("silence", SILENCE))),
+                   help="give up when the Amiga has not answered for this "
+                        "long (default %d s); exit code %d"
+                        % (SILENCE, EXIT_SILENT))
+    p.add_argument("--json", action="store_true",
+                   help="print results as JSON (ls, ps, screen, windows, "
+                        "ping, run, wait, grab, health)")
+    p.add_argument("--native", action="store_true",
+                   default=os.environ.get("WASABI_COORDS",
+                                          cfg.get("coords", "")) == "native",
+                   help="coordinates in the screen's own pixels (a 640x256 "
+                        "screen stays 640x256) instead of the picture's; "
+                        "also WASABI_COORDS=native or 'coords = native'")
+    p.add_argument("--plain", action="store_true",
+                   help="no encryption for this command, even with keys "
+                        "(an Amiga that requires it refuses)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    # --json is also accepted after the command (`wasabi grab --json`),
+    # which is where people write it. SUPPRESS keeps the subparser from
+    # resetting a --json given before the command back to False.
+    json_too = argparse.ArgumentParser(add_help=False)
+    json_too.add_argument("--json", action="store_true",
+                          default=argparse.SUPPRESS,
+                          help="print results as JSON")
+    _add = sub.add_parser
+
+    def add_parser(name, **kw):
+        if name in JSON_COMMANDS:
+            kw.setdefault("parents", []).append(json_too)
+        return _add(name, **kw)
+    sub.add_parser = add_parser
+
+    sub.add_parser("discover", help="find Amigas on this network"
+                   ).set_defaults(fn=cmd_discover, no_conn=True)
+    sub.add_parser("ping", help="check the daemon is alive").set_defaults(
+        fn=cmd_ping)
+    sub.add_parser("info", help="machine and daemon info").set_defaults(
+        fn=cmd_info)
+
+    s = sub.add_parser("ls", help="list a drawer")
+    s.add_argument("path", nargs="?", default="")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("put", help="upload a file")
+    s.add_argument("local")
+    s.add_argument("remote")
+    s.add_argument("-q", "--quiet", action="store_true")
+    s.add_argument("--force", action="store_true",
+                   help="allow it in a system place (SYS: C: L: LIBS: DEVS: "
+                        "S: FONTS: LOCALE: ENVARC:, and any 'protect =' "
+                        "volumes in the config)")
+    s.set_defaults(fn=cmd_put)
+
+    s = sub.add_parser("get", help="download a file ('-' for stdout)")
+    s.add_argument("remote")
+    s.add_argument("local")
+    s.set_defaults(fn=cmd_get)
+
+    s = sub.add_parser("run", help="execute a command, streaming its output")
+    s.add_argument("command")
+    s.add_argument("--merge", action="store_true",
+                   help="accepted, and always so: AmigaOS 3 gives a "
+                        "command no separate error channel (that is new "
+                        "in OS 4), so its output is one stream")
+    s.add_argument("--detach", action="store_true",
+                   help="start it and return at once - for programs with "
+                        "a window, which never end by themselves; their "
+                        "output goes to a file in T: (named on stderr)")
+    s.add_argument("--max-time", type=float, metavar="SECONDS",
+                   help="stop the command with Ctrl-C if it runs longer; "
+                        "exit code %d" % EXIT_TIME_LIMIT)
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("deploy",
+                       help="upload, then optionally run, reboot or restart")
+    s.add_argument("local")
+    s.add_argument("remote")
+    s.add_argument("--run", metavar="CMD")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--reboot", action="store_true")
+    g.add_argument("--restart", action="store_true",
+                   help="reload the daemon afterwards")
+    s.add_argument("--cold", action="store_true")
+    s.add_argument("--force", action="store_true",
+                   help="allow uploading into a system place (L:, C:, ...)")
+    s.set_defaults(fn=cmd_deploy)
+
+    s = sub.add_parser("update",
+                       help="replace the daemon itself, verifying first")
+    s.add_argument("local", help="the new wasabid binary")
+    s.add_argument("--sidecar", default="C:wasabid.new",
+                   help="where to stage it on the Amiga")
+    s.add_argument("--no-trial", action="store_true",
+                   help="do not start a trial daemon on a spare port "
+                        "first; identity and self-test still run. Use "
+                        "when the trial stage itself destabilises the "
+                        "machine")
+    s.add_argument("--testport", type=int, default=0,
+                   help="port for the trial instance (default: --port + 1)")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("quit", help="stop the daemon (needs --yes)")
+    s.add_argument("--yes", action="store_true",
+                   help="confirm: nothing restarts it but physical access")
+    s.add_argument("--force", action="store_true",
+                   help="Ctrl-C a running command first; one that ignores "
+                        "the signal still blocks the quit")
+    s.set_defaults(fn=cmd_quit)
+
+    s = sub.add_parser("debug", help="live KPrintF stream")
+    s.add_argument("--with-snoop", action="store_true",
+                   help="merge the DOS call trace into the same view")
+    s.add_argument("--task", default="",
+                   help="task filter for --with-snoop")
+    s.add_argument("--entry", action="store_true",
+                   help="log snooped calls on the way in too, so a call "
+                        "that never returns is still seen (slow)")
+    s.add_argument("--ignore-wasabi", action="store_true",
+                   help="hide wasabi's own footprint - the daemon, the "
+                        "runner behind 'wasabi run', and its temp files - "
+                        "so the trace shows what you are debugging")
+    s.add_argument("--output", choices=("minimal", "normal", "full"),
+                   default="normal",
+                   help="how much to show: full is every line as it "
+                        "arrives, normal folds runs of identical lines, "
+                        "minimal also hides routine shell and poll noise")
+    s.add_argument("--log", metavar="FILE",
+                   help="append timestamped lines to FILE")
+    s.add_argument("--once", action="store_true",
+                   help="stop when the connection drops instead of "
+                        "reconnecting forever")
+    s.add_argument("--for", dest="for_", type=float, metavar="SECONDS",
+                   help="stop after this long (exit 0; with --until, "
+                        "exit %d if the text never came)" % EXIT_TIME_LIMIT)
+    s.add_argument("--until", metavar="TEXT",
+                   help="stop as soon as a line contains TEXT "
+                        "(any case) - wait for a program to say something")
+    s.set_defaults(fn=cmd_stream, mode="debug")
+
+    s = sub.add_parser("snoop", help="live DOS call trace")
+    s.add_argument("--task", default="", help="AmigaDOS pattern to filter on")
+    s.add_argument("--entry", action="store_true",
+                   help="log each call on the way in as well as on the way "
+                        "out, so a call that never returns is still seen; "
+                        "costs a task switch per call")
+    s.add_argument("--ignore-wasabi", action="store_true",
+                   help="hide wasabi's own footprint - the daemon, the "
+                        "runner behind 'wasabi run', and its temp files - "
+                        "so the trace shows what you are debugging")
+    s.add_argument("--output", choices=("minimal", "normal", "full"),
+                   default="normal",
+                   help="how much to show: full is every line as it "
+                        "arrives, normal folds runs of identical lines, "
+                        "minimal also hides routine shell and poll noise")
+    s.add_argument("--log", metavar="FILE",
+                   help="append timestamped lines to FILE")
+    s.add_argument("--once", action="store_true",
+                   help="stop when the connection drops instead of "
+                        "reconnecting forever")
+    s.add_argument("--for", dest="for_", type=float, metavar="SECONDS",
+                   help="stop after this long (exit 0; with --until, "
+                        "exit %d if the text never came)" % EXIT_TIME_LIMIT)
+    s.add_argument("--until", metavar="TEXT",
+                   help="stop as soon as a line contains TEXT "
+                        "(any case) - wait for a program to say something")
+    s.set_defaults(fn=cmd_stream, mode="snoop")
+
+    s = sub.add_parser("speedtest",
+                       help="measure latency and throughput both ways")
+    s.add_argument("size", nargs="?", default="10MB",
+                   help="payload size, e.g. 5MB (default 10MB)")
+    s.add_argument("--pings", type=int, default=200, metavar="N",
+                   help="round trips in the latency phase (0 skips it)")
+    s.add_argument("--target", metavar="PATH",
+                   help="write through a real volume (e.g. Dump:) instead of "
+                        "discarding - measures the filesystem, not the wire")
+    s.set_defaults(fn=cmd_speedtest)
+
+    s = sub.add_parser("grab", help="grab the front screen, or one "
+                       "window, as a PNG; prints the file's path")
+    s.add_argument("file", nargs="?", default=None,
+                   help="where to write it (default: a new file in %s)"
+                        % GRAB_DIR)
+    s.add_argument("--window", metavar="TITLE",
+                   help="just the frontmost window whose title contains "
+                        "TITLE (any case)")
+    s.add_argument("--screen", metavar="NAME",
+                   help="public screen to grab (default: the front one)")
+    s.add_argument("--raw", action="store_true",
+                   help="no aspect correction - keep the pixels exactly "
+                        "as read (a 640x256 screen stays 640x256)")
+    s.add_argument("--region", metavar="X,Y,W,H",
+                   help="just this rectangle of the screen, in the same "
+                        "pixels as the picture")
+    s.add_argument("--diff", metavar="BASELINE.png",
+                   help="compare this grab against an earlier one and "
+                        "report what changed; exits 1 if anything did, "
+                        "like diff(1), so it scripts as a regression check")
+    s.set_defaults(fn=cmd_grab)
+
+    s = sub.add_parser("mouse", help="move the pointer, click, drag "
+                       "menus, turn the wheel")
+    s.add_argument("action",
+                   choices=["move", "click", "doubleclick", "down", "up",
+                            "wheel", "where"])
+    s.add_argument("x", nargs="?", type=mouse_arg, default=None,
+                   help="absolute X in grab's pixel space; click without "
+                        "coordinates clicks where the pointer is. "
+                        "wheel: up or down")
+    s.add_argument("y", nargs="?", type=mouse_arg, default=None,
+                   help="wheel: how many notches (default 1)")
+    s.add_argument("--right", action="store_true",
+                   help="right (menu) button instead of the left")
+    s.add_argument("--middle", action="store_true")
+    s.set_defaults(fn=cmd_mouse)
+
+    s = sub.add_parser("key", help="type text or press keys on the Amiga")
+    s.add_argument("action", choices=["type", "press"],
+                   help="type: text through the Amiga's own keymap; "
+                        "press: keys by name, e.g. return, f1, ramiga+w")
+    s.add_argument("keys", nargs="+")
+    s.add_argument("--enter", action="store_true",
+                   help="press Return after the text")
+    s.set_defaults(fn=cmd_key)
+
+    s = sub.add_parser("wait", help="wait for a window, task, file, "
+                       "screen change - or for the Amiga to come back")
+    s.add_argument("what", choices=["window", "task", "file", "change",
+                                    "still", "up"],
+                   help="window TITLE: a window whose title contains it; "
+                        "task NAME: a task (AmigaDOS pattern); file PATH; "
+                        "change [TITLE]: the screen (or a window) changes; "
+                        "still [TITLE]: it stops changing; up: the Amiga "
+                        "answers again (after a reboot)")
+    s.add_argument("target", nargs="?", default=None)
+    s.add_argument("--gone", action="store_true",
+                   help="wait for the window, task or file to go away")
+    s.add_argument("--contains", metavar="TEXT",
+                   help="file: wait until it contains TEXT (any case)")
+    s.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
+                   help="give up after this long (default 30); exit code "
+                        "%d" % EXIT_TIME_LIMIT)
+    s.add_argument("--every", type=float, default=0.5, metavar="SECONDS",
+                   help="how often to look (default 0.5)")
+    s.add_argument("--quiet", type=float, default=1.0, metavar="SECONDS",
+                   help="still: how long nothing may change (default 1)")
+    s.add_argument("--region", metavar="X,Y,W,H",
+                   help="change/still: watch only this rectangle")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("sum", help="a checksum of the screen, a window or "
+                       "a region, worked out on the Amiga")
+    s.add_argument("--window", metavar="TITLE",
+                   help="just the frontmost window whose title contains it")
+    s.add_argument("--region", metavar="X,Y,W,H",
+                   help="just this rectangle, in the picture's pixels")
+    s.add_argument("--since", metavar="SUM",
+                   help="compare with an earlier sum; exit 1 if unchanged")
+    s.set_defaults(fn=cmd_sum)
+
+    for name, mode, helptext in (
+            ("view", "view", "the Amiga's screen in a window, driven with "
+                             "your mouse and keyboard"),
+            ("desktop", "desktop", "the Wasabi desktop app: live stats, "
+                                   "screen, files, screenshots")):
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("--port", dest="view_port", type=int, default=8070,
+                       help="where the page is served (default 8070)")
+        s.add_argument("--listen", default="127.0.0.1",
+                       help="address to serve on (default this PC only)")
+        s.add_argument("--no-browser", action="store_true",
+                       help="do not open a window; just print the address")
+        s.add_argument("--kiosk", action="store_true",
+                       help="open full screen")
+        s.add_argument("--stay", action="store_true",
+                       help="keep serving after the window closes")
+        s.add_argument("--browser", action="store_true",
+                       help="open in the web browser even when an app "
+                            "window is possible")
+        s.set_defaults(fn=cmd_view, no_conn=True, mode=mode)
+
+    s = sub.add_parser("clip", help="read or set the Amiga's clipboard")
+    s.add_argument("action", choices=["get", "set"])
+    s.add_argument("text", nargs="?", default=None,
+                   help="set: the text (or '-' / nothing: read it from stdin)")
+    s.set_defaults(fn=cmd_clip)
+
+    s = sub.add_parser("serve", help="the desktop app as a server with a "
+                       "login - for Wasabi phone, on the NAS")
+    s.add_argument("--port", dest="view_port", type=int, default=8077,
+                   help="where to serve (default 8077)")
+    s.add_argument("--listen", default="0.0.0.0",
+                   help="address to serve on (default every address)")
+    s.add_argument("--files", default=os.path.expanduser("~/Wasabi"),
+                   help="the folder the Files page may use, and where "
+                        "screenshots go (default ~/Wasabi)")
+    s.set_defaults(fn=cmd_view, no_conn=True, mode="server", stay=True,
+                   no_browser=True, kiosk=False)
+
+    s = sub.add_parser("health", help="the Pi's temperature, voltage and "
+                       "power history, Emu68's CPU meter, free memory")
+    s.add_argument("--watch", type=float, nargs="?", const=2.0,
+                   metavar="SECONDS",
+                   help="repeat every SECONDS (default 2) until Ctrl-C")
+    s.add_argument("--raw", action="store_true",
+                   help="the daemon's own key/value lines")
+    s.set_defaults(fn=cmd_health)
+
+    s = sub.add_parser("windows", help="list every screen and window")
+    s.add_argument("--raw", action="store_true",
+                   help="the daemon's tab-separated lines, for scripts")
+    s.set_defaults(fn=cmd_windows)
+
+    s = sub.add_parser("ui", help="gadgets and menus by name: list, "
+                       "click, set a text field, pick a menu item")
+    s.add_argument("action",
+                   choices=["list", "menus", "click", "set", "menu", "front"],
+                   help="list: gadgets and menus; menus: menus only; "
+                        "click NAME: click a gadget; set NAME TEXT: fill a "
+                        "text field; menu PATH: pick 'Project/Quit'; "
+                        "front TITLE: bring a window to the front")
+    s.add_argument("name", nargs="?",
+                   help="gadget label (or close, depth, zoom, size, drag), "
+                        "menu path, or window title for 'front'")
+    s.add_argument("text", nargs="?", help="set: the text to type")
+    s.add_argument("--window", metavar="TITLE",
+                   help="only the window whose title contains this")
+    s.add_argument("--all-screens", action="store_true",
+                   help="list: every screen, not only the front one")
+    s.add_argument("--kind", help="only gadgets of this kind (button, "
+                   "string, toggle, prop, custom, ...)")
+    s.add_argument("--nth", type=int, help="the Nth of several matches")
+    s.add_argument("--id", type=int, metavar="N",
+                   help="click/set: the gadget whose GadgetID is N (the id "
+                        "'ui list' shows; stays put when the layout moves)")
+    s.add_argument("--double", action="store_true", help="double-click")
+    s.add_argument("--no-enter", action="store_true",
+                   help="set: do not press Return after the text")
+    s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("keys", help="the encryption keys: init (once), "
+                       "amiga NAME (install on an Amiga), drive DIR NAME "
+                       "(an emulator's drive), show, forget HOST (allow "
+                       "plain again to an Amiga reached encrypted before)")
+    s.add_argument("action", choices=["init", "amiga", "drive", "show",
+                                      "forget"])
+    s.add_argument("where", nargs="?",
+                   help="amiga: the Amiga's name; drive: the drive folder")
+    s.add_argument("name", nargs="?", help="drive: the Amiga's name")
+    s.set_defaults(fn=keys_amiga)
+
+    s = sub.add_parser("mcp", help="run the MCP server on stdin/stdout, "
+                       "for AI assistants (claude mcp add wasabi -- wasabi "
+                       "mcp)")
+    s.set_defaults(fn=cmd_mcp, no_conn=True)
+
+    s = sub.add_parser("arexx", help="send a command to a program's ARexx "
+                       "port; with no port, list the ports")
+    # dest is not "port": that is the global --port, the daemon's.
+    s.add_argument("rexxport", nargs="?", metavar="port",
+                   help="the ARexx port name (case matters)")
+    s.add_argument("command", nargs="*", help="the command to send")
+    s.add_argument("--ports", action="store_true",
+                   help="list the public ports")
+    s.add_argument("--timeout", type=float, default=30,
+                   help="seconds to wait for the answer (default 30)")
+    s.set_defaults(fn=cmd_arexx)
+
+    s = sub.add_parser("rexx", help="run an ARexx program; its output "
+                       "comes back, the exit code is its rc")
+    s.add_argument("program", nargs="*",
+                   help="the program text, e.g. 'say 1+1'")
+    s.add_argument("--file", "-f", metavar="FILE",
+                   help="the program from a file on this computer (- for "
+                        "stdin)")
+    s.add_argument("--max-time", type=float, metavar="S",
+                   help="stop it with Ctrl-C after S seconds")
+    s.set_defaults(fn=cmd_rexx)
+
+    s = sub.add_parser("input", help="a batch of key and mouse events, "
+                       "played by the Amiga with fixed gaps")
+    s.add_argument("steps", nargs="*",
+                   help="steps: 'key ramiga+w', 'type hello', 'move X Y', "
+                        "'click [X Y]', 'double', 'down [X Y]', 'up [X Y]' "
+                        "(+ right/middle), 'wait N'")
+    s.add_argument("--gap", type=int, default=1, metavar="TICKS",
+                   help="ticks (1/50 s) between events (default 1)")
+    s.add_argument("--file", "-f", metavar="FILE",
+                   help="steps from a file, one per line (- for stdin)")
+    s.set_defaults(fn=cmd_input)
+
+    s = sub.add_parser("screen", help="list screens; flip between them")
+    s.add_argument("--list", action="store_true",
+                   help="list the open screens (the default)")
+    s.add_argument("--cycle", action="store_true",
+                   help="send the front screen to the back (what Amiga+M does)")
+    s.add_argument("--to-front", metavar="TITLE",
+                   help="bring the screen with this title to the front")
+    s.set_defaults(fn=cmd_screen)
+
+    s = sub.add_parser("ps", help="list tasks and processes")
+    s.add_argument("pattern", nargs="?", default="",
+                   help="AmigaDOS wildcard to filter on")
+    s.set_defaults(fn=cmd_ps)
+
+    s = sub.add_parser("kill", help="stop a task (polite Ctrl-C by default)")
+    s.add_argument("target", help="task/command name, or 0xADDRESS from ps")
+    s.add_argument("--force", action="store_true",
+                   help="RemTask() it - no cleanup, last resort")
+    s.set_defaults(fn=cmd_kill)
+
+    sub.add_parser("slots", help="what each run slot is running"
+                   ).set_defaults(fn=cmd_slots)
+
+    s = sub.add_parser("free", help="stop a run slot's command, or let "
+                       "go of the slot if it will not stop")
+    s.add_argument("slot", type=int, help="the slot number from 'slots'")
+    s.add_argument("--ctrl-c-only", action="store_true",
+                   help="only send Ctrl-C; never let go of the slot")
+    s.set_defaults(fn=cmd_free)
+
+    s = sub.add_parser("reboot", help="reboot the Amiga")
+    s.add_argument("--cold", action="store_true",
+                   help="accepted for the wire's sake; every reboot is "
+                        "currently cold (ColdReboot is all exec offers)")
+    s.add_argument("--yes", action="store_true",
+                   help="really reboot (required)")
+    s.add_argument("--wait", type=float, nargs="?", const=120.0,
+                   metavar="SECONDS",
+                   help="then wait until the Amiga answers again "
+                        "(default up to 120 s)")
+    s.set_defaults(fn=cmd_reboot)
+
+    s = sub.add_parser("restart", help="reload the daemon in place (self-update)")
+    s.add_argument("--force", action="store_true",
+                   help="Ctrl-C a running command first; one that ignores "
+                        "the signal still blocks the restart")
+    s.set_defaults(fn=cmd_restart)
+
+    s = sub.add_parser("del", help="delete a file")
+    s.add_argument("path")
+    s.add_argument("--force", action="store_true",
+                   help="allow it in a system place (SYS: C: L: LIBS: DEVS: "
+                        "S: FONTS: LOCALE: ENVARC:, and any 'protect =' "
+                        "volumes in the config)")
+    s.set_defaults(fn=cmd_del)
+
+    s = sub.add_parser("mkdir", help="create a drawer")
+    s.add_argument("path")
+    s.set_defaults(fn=cmd_mkdir)
+
+    args = p.parse_args(argv)
+    SILENCE = max(1.0, args.silence)
+    global PLAIN
+    if args.plain:
+        PLAIN = True
+    global NATIVE
+    NATIVE = args.native
+    if args.cmd == "keys" and args.action != "amiga":
+        args.fn, args.no_conn = cmd_keys, True
+    args.protect = {v.strip().rstrip(":").lower()
+                    for v in cfg.get("protect", "").split(",") if v.strip()}
+
+    # NB: 'local' is a positional in put/get - do not reuse that name here.
+    if args.cmd == "wait" and args.what == "up":
+        args.fn, args.no_conn = cmd_wait_up, True
+    if getattr(args, "no_conn", False):
+        try:
+            return args.fn(args) or 0
+        except TimeLimit as exc:
+            print("wasabi: %s" % exc, file=sys.stderr)
+            return EXIT_TIME_LIMIT
+        except WasabiError as exc:
+            print("wasabi: %s" % exc, file=sys.stderr)
+            return 1
+
+    # Which wire capability each subcommand needs, where a daemon might
+    # plausibly be too old to have it. Everything not listed here has
+    # been in wasabid since the first working build.
+    needs = {"ps": "ps", "kill": "kill", "speedtest": "speed",
+             "snoop": "snoop", "debug": "debug", "restart": "restart",
+             "quit": "quit", "update": "install",
+             "grab": "grab", "screen": "screen",
+             "mouse": "mouse", "key": "key",
+             "windows": "windows", "health": "health",
+             "clip": "clip", "slots": "slots", "free": "slots",
+             "ui": "ui", "arexx": "arexx", "sum": "sum",
+             "input": "inputs"}.get(args.cmd)
+    if args.cmd == "wait":
+        needs = {"window": "windows", "change": "grab",
+                 "still": "grab"}.get(args.what)
+    if args.cmd == "mouse" and args.action == "wheel":
+        needs = "key"                    # the wheel is raw keys
+
+    try:
+        host, port = resolve_target(args)
+    except WasabiError as exc:
+        print("wasabi: %s" % exc, file=sys.stderr)
+        return 2
+    try:
+        conn = Conn(host, port, args.key)
+    except AmigaSilent as exc:
+        print("wasabi: %s" % exc, file=sys.stderr)
+        return EXIT_SILENT
+    except (OSError, WasabiError) as exc:
+        print("wasabi: cannot reach %s:%d - %s" % (host, port, exc),
+              file=sys.stderr)
+        return 2
+    warn_if_refusals_grew(conn, host)
+
+    # Only refuse when the daemon actually told us what it can do; an
+    # empty set means it predates the list, so try and report the result.
+    if needs and conn.caps and needs not in conn.caps:
+        print("wasabi: this daemon (%s) has no '%s' - update it with "
+              "'wasabi update wasabid'" % (conn.banner, needs),
+              file=sys.stderr)
+        conn.close()
+        return 2
+    try:
+        return args.fn(conn, args) or 0
+    except TimeLimit as exc:
+        print("wasabi: %s" % exc, file=sys.stderr)
+        return EXIT_TIME_LIMIT
+    except AmigaSilent as exc:
+        print("wasabi: %s" % exc, file=sys.stderr)
+        return EXIT_SILENT
+    except WasabiError as exc:
+        print("wasabi: %s" % exc, file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 1
+    except socket.timeout:
+        # Connected, asked, and nothing came back: a frozen machine, or
+        # a daemon stuck on something. Say so plainly - a script must
+        # never sit here, and neither should a person.
+        print("wasabi: the Amiga stopped answering (nothing for %d s)"
+              % SILENCE, file=sys.stderr)
+        return EXIT_SILENT
+    except OSError as exc:
+        print("wasabi: the connection failed - %s" % exc, file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -12,6 +12,8 @@ mkdir -p "$APP/Contents/MacOS"
 cp "$(swift build -c release --show-bin-path)/Amiga-View" "$APP/Contents/MacOS/Amiga-View"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
+# wasabi client for Amiga > Reset Amiga... (vendored, see Resources/wasabi/VENDORED.md)
+cp Resources/wasabi/wasabi.py "$APP/Contents/Resources/wasabi.py"
 rm -rf build/AppIcon.iconset
 swift scripts/make-icon.swift build/AppIcon.iconset
 iconutil -c icns build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
