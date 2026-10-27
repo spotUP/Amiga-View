@@ -14,7 +14,13 @@ cp "$(swift build -c release --show-bin-path)/Amiga-View" "$APP/Contents/MacOS/A
 scripts/librashader.sh
 mkdir -p "$APP/Contents/Frameworks"
 cp build/librashader/librashader.dylib "$APP/Contents/Frameworks/librashader.dylib"
-install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/Amiga-View"
+# Package.swift's dev rpath points into build/; the app must load only its own copy
+install_name_tool -delete_rpath "$PWD/build/librashader" \
+    -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/Amiga-View"
+if otool -l "$APP/Contents/MacOS/Amiga-View" | grep -q "$PWD/build"; then
+    echo "error: executable still has an rpath into $PWD/build" >&2
+    exit 1
+fi
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 # wasabi client for Amiga > Reset Amiga... (vendored, see Resources/wasabi/VENDORED.md)
