@@ -270,6 +270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Window and menu
 
     func buildWindow() {
+        // One window: no tab bar and no Show Tab Bar / Merge All Windows items in the menus.
+        NSWindow.allowsAutomaticWindowTabbing = false
         window = NSWindow(contentRect: NSRect(origin: .zero, size: ViewGeometry.actualSize),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
@@ -278,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.initialFirstResponder = video
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.isReleasedWhenClosed = false
+        window.tabbingMode = .disallowed
         if let name = frameAutosaveName {
             if !window.setFrameUsingName(name) { window.center() }
             window.setFrameAutosaveName(name)

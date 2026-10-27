@@ -58,6 +58,12 @@ final class CaptureMenuTests: XCTestCase {
         XCTAssertEqual(try item("Start Recording").keyEquivalent, "r")
     }
 
+    /// The tab bar showed one useless tab, "Amiga-View": the app has one window, so tabbing is off.
+    func testWindowHasNoTabBar() {
+        XCTAssertFalse(NSWindow.allowsAutomaticWindowTabbing)
+        XCTAssertEqual(app.window.tabbingMode, .disallowed)
+    }
+
     func testSnapshotWritesThePicture() throws {
         try invoke("Save Snapshot")   // no frame yet
         XCTAssertTrue(files("png").isEmpty)
