@@ -5,13 +5,13 @@
 # changes, so the grant would be lost; a certificate's stays the same across rebuilds.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# librashader (Metal filter chain), built by scripts/librashader.sh; the link needs it, found at run time via @rpath
+scripts/librashader.sh
 swift build -c release
 APP=build/Amiga-View.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$(swift build -c release --show-bin-path)/Amiga-View" "$APP/Contents/MacOS/Amiga-View"
-# librashader (Metal filter chain), built by scripts/librashader.sh; found via @rpath
-scripts/librashader.sh
 mkdir -p "$APP/Contents/Frameworks"
 cp build/librashader/librashader.dylib "$APP/Contents/Frameworks/librashader.dylib"
 # Package.swift's dev rpath points into build/; the app must load only its own copy
