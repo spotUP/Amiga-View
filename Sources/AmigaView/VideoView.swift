@@ -141,9 +141,12 @@ final class VideoView: NSView {
 
     private var scale: CGFloat { window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1 }
 
-    /// Where the picture is drawn in the drawable, in pixels.
+    /// Where the picture is drawn in the drawable, in pixels. A shader chain gets the whole
+    /// drawable: the preset places the screen itself (aspect, integer scale) and draws its bezel
+    /// around it, so fitting first would shrink the screen and bezel into the middle.
     var pictureRect: CGRect {
-        ViewGeometry.pictureRect(in: bounds.size, scale: scale, crop: crop, integerScaling: integerScaling)
+        chain != nil ? CGRect(origin: .zero, size: metalLayer.drawableSize)
+                     : ViewGeometry.pictureRect(in: bounds.size, scale: scale, crop: crop, integerScaling: integerScaling)
     }
 
     /// Keeps drawableSize equal to bounds * scale, so no frame is drawn with a rect from the new

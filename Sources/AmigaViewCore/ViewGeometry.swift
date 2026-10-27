@@ -70,7 +70,7 @@ public enum ViewGeometry {
 
     /// Where the picture is drawn in the drawable, in pixels: `crop` fitted into `bounds` (points)
     /// with `integerScaling` applied in points, then scaled by the backing `scale`. This is the
-    /// viewport of the plain blit and of the shader chain's final scale pass.
+    /// viewport of the plain blit; a shader chain draws into the whole drawable instead.
     public static func pictureRect(in bounds: CGSize, scale: CGFloat, crop: CGRect, integerScaling: Bool) -> CGRect {
         let content = displaySize(of: crop)
         let r = integerScaling ? integerFit(in: bounds, content: content) : fit(in: bounds, content: content)

@@ -79,6 +79,25 @@ final class PictureRendererTests: XCTestCase {
         lock.lock(); XCTAssertEqual(loaded.count, 2); lock.unlock()
     }
 
+    /// With a shader chain the picture fills the whole drawable: the preset places the screen and
+    /// draws its bezel around it. Without one it keeps the (integer) fit.
+    func testShaderChainDrawsIntoTheWholeDrawable() throws {
+        let video = VideoView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        try XCTSkipIf(video.renderer == nil, "no Metal device")
+        video.integerScaling = true
+        video.image = try field()
+        let scale = video.metalLayer.contentsScale
+        let fitted = ViewGeometry.pictureRect(in: video.bounds.size, scale: scale, crop: video.crop, integerScaling: true)
+        XCTAssertEqual(video.pictureRect, fitted)
+        video.shaderPreset = Self.preset
+        let deadline = Date().addingTimeInterval(30)
+        while video.chain == nil, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        XCTAssertEqual(video.shaderState, .ready)
+        XCTAssertEqual(video.pictureRect, CGRect(x: 0, y: 0, width: 1000 * scale, height: 700 * scale))
+        video.shaderPreset = nil
+        XCTAssertEqual(video.pictureRect, fitted)
+    }
+
     /// A frame after a bounds change and before layout still draws into a drawable of the new size.
     func testDrawableSizeFollowsBoundsAtDrawTime() throws {
         let video = VideoView(frame: NSRect(x: 0, y: 0, width: 720, height: 576))
