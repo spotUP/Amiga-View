@@ -38,8 +38,11 @@ final class ResetMenuTests: XCTestCase {
 
     private func log() -> String { (try? String(contentsOf: mockLog, encoding: .utf8)) ?? "" }
 
-    /// Starts the mock on a free port with key "testkey" and points the app at it, with wasabi's
-    /// config and cache in the temp directory so the user's own are never read or written.
+    private var keyFile: URL { dir.appendingPathComponent("replay-wasabi.key") }
+
+    /// Starts the mock on a free port with key "testkey" and points the app at it and at a key
+    /// file holding that key, with wasabi's config and cache in the temp directory so the user's
+    /// own are never read or written.
     private func startMock() throws {
         let port = try freePort()
         FileManager.default.createFile(atPath: mockLog.path, contents: nil)
@@ -57,7 +60,9 @@ final class ResetMenuTests: XCTestCase {
         XCTAssertTrue(log().contains("mock-wasabid on"), log())
         app.defaults.set("127.0.0.1", forKey: "amigaHost")
         app.defaults.set(port, forKey: "amigaPort")
-        app.resetEnvironment = ["PATH": "/usr/bin:/bin", "HOME": dir.path, "WASABI_KEY": "testkey",
+        try "testkey\n".write(to: keyFile, atomically: true, encoding: .utf8)
+        app.defaults.set(keyFile.path, forKey: "amigaKeyFile")
+        app.resetEnvironment = ["PATH": "/usr/bin:/bin", "HOME": dir.path,
                                 "XDG_CONFIG_HOME": dir.appendingPathComponent("config").path,
                                 "XDG_CACHE_HOME": dir.appendingPathComponent("cache").path]
     }
@@ -100,7 +105,7 @@ final class ResetMenuTests: XCTestCase {
 
     func testWrongKeyShowsWhy() throws {
         try startMock()
-        app.resetEnvironment?["WASABI_KEY"] = "wrong"
+        try "wrong\n".write(to: keyFile, atomically: true, encoding: .utf8)
         app.confirmReset = { true }
         let finished = expectation(description: "finished")
         var result = ""
@@ -110,5 +115,17 @@ final class ResetMenuTests: XCTestCase {
         XCTAssertTrue(result.hasPrefix("Reset failed: "), result)
         XCTAssertTrue(result.contains("bad key"), result)
         XCTAssertFalse(log().contains("REBOOT requested"), log())
+    }
+
+    func testMissingKeyFileSaysWhere() throws {
+        try startMock()
+        try FileManager.default.removeItem(at: keyFile)
+        app.confirmReset = { true }
+        let finished = expectation(description: "finished")
+        var result = ""
+        app.resetFinished = { result = $0; finished.fulfill() }
+        try invoke("Reset Amiga...")
+        wait(for: [finished], timeout: 5)
+        XCTAssertEqual(result, "Reset failed: no key in \(keyFile.path)")
     }
 }

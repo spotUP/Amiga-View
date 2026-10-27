@@ -6,15 +6,28 @@ final class AmigaResetTests: XCTestCase {
         let suite = "amiga-reset-" + UUID().uuidString
         let store = UserDefaults(suiteName: suite)!
         defer { store.removePersistentDomain(forName: suite) }
-        XCTAssertEqual(AmigaReset.load(from: store), AmigaReset(host: "192.168.0.66", port: 1234))
+        XCTAssertEqual(AmigaReset.load(from: store), AmigaReset(host: "192.168.0.74", port: 1234,
+                                                                   keyFile: "~/.config/up-term/replay-wasabi.key"))
         store.set("10.0.0.5", forKey: "amigaHost")
         store.set(4321, forKey: "amigaPort")
-        XCTAssertEqual(AmigaReset.load(from: store), AmigaReset(host: "10.0.0.5", port: 4321))
+        store.set("/k", forKey: "amigaKeyFile")
+        XCTAssertEqual(AmigaReset.load(from: store), AmigaReset(host: "10.0.0.5", port: 4321, keyFile: "/k"))
     }
 
     func testArgumentsAlwaysNameTheHost() {
-        let args = AmigaReset(host: "10.0.0.5", port: 1234).arguments(script: URL(fileURLWithPath: "/x/wasabi.py"))
+        let args = AmigaReset(host: "10.0.0.5", port: 1234, keyFile: "/k").arguments(script: URL(fileURLWithPath: "/x/wasabi.py"))
         XCTAssertEqual(args, ["-I", "/x/wasabi.py", "--host", "10.0.0.5", "--port", "1234", "reboot", "--yes"])
+    }
+
+    func testKeyIsTheFirstLineOfTheKeyFile() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("key-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let reset = AmigaReset(host: "h", port: 1, keyFile: file.path)
+        XCTAssertNil(reset.key())
+        try "  secret \nignored\n".write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertEqual(reset.key(), "secret")
+        try "\n".write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertNil(reset.key())
     }
 
     func testOutcomeReadsTheLastErrorLine() {

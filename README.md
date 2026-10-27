@@ -65,10 +65,12 @@ Amiga > Reset Amiga... asks first, then reboots the A1200 through wasabid, the d
 
 The app runs the vendored wasabi client (`Resources/wasabi/wasabi.py`, copied into the app bundle) with `/usr/bin/python3`. It always names the host, because without one wasabi searches the network and also finds wasabid inside emulators on this Mac. The status line shows "Resetting the Amiga", then "Amiga is rebooting" or "Reset failed: reason".
 
-    defaults write com.spotup.amiga-view amigaHost 192.168.0.66
+    defaults write com.spotup.amiga-view amigaHost 192.168.0.74
     defaults write com.spotup.amiga-view amigaPort -int 1234
 
-The key comes from wasabi's own config, `~/.config/wasabi/config` (`key = ...`).
+    defaults write com.spotup.amiga-view amigaKeyFile ~/.config/up-term/replay-wasabi.key
+
+The key is the first line of UP-Term's key file (`amigaKeyFile`, default `~/.config/up-term/replay-wasabi.key`): UP-Term installs wasabid on the Amiga with that key, while wasabi's own config can hold an older one. It goes to wasabi in `WASABI_KEY`, never on the command line.
 
 ## With Deskflow
 

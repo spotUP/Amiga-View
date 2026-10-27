@@ -3,27 +3,40 @@ import Foundation
 /// Reboots the A1200 through wasabid, the daemon running on it: its REBOOT verb calls exec's
 /// ColdReboot. Keys cannot do it: the Ctrl-Amiga-Amiga reset lives in the A1200's keyboard
 /// hardware, and keys that arrive over Synergy never pass through it.
-/// Stored in UserDefaults (keys: amigaHost, amigaPort); the key wasabid checks comes from
-/// wasabi's own config (~/.config/wasabi/config).
+/// Stored in UserDefaults (keys: amigaHost, amigaPort, amigaKeyFile). The key wasabid checks is
+/// read from UP-Term's key file, because UP-Term installs wasabid on the Amiga with that key;
+/// wasabi's own config can hold an older one.
 public struct AmigaReset: Equatable {
     public var host: String
     public var port: Int
+    public var keyFile: String
 
-    public static let defaults = AmigaReset(host: "192.168.0.66", port: 1234)
+    public static let defaults = AmigaReset(host: "192.168.0.74", port: 1234,
+                                            keyFile: "~/.config/up-term/replay-wasabi.key")
     public static let python = URL(fileURLWithPath: "/usr/bin/python3")
     public static let confirmText = "Reset the Amiga?"
     public static let confirmDetail = "The Amiga reboots at once. Anything open there is lost."
     public static let startedStatus = "Resetting the Amiga"
     public static let doneStatus = "Amiga is rebooting"
 
-    public init(host: String, port: Int) {
-        self.host = host; self.port = port
+    public init(host: String, port: Int, keyFile: String) {
+        self.host = host; self.port = port; self.keyFile = keyFile
     }
 
     public static func load(from store: UserDefaults = .standard) -> AmigaReset {
         let d = AmigaReset.defaults
         let port = store.integer(forKey: "amigaPort")
-        return AmigaReset(host: store.string(forKey: "amigaHost") ?? d.host, port: port > 0 ? port : d.port)
+        return AmigaReset(host: store.string(forKey: "amigaHost") ?? d.host, port: port > 0 ? port : d.port,
+                          keyFile: store.string(forKey: "amigaKeyFile") ?? d.keyFile)
+    }
+
+    /// The key file's first line, or nil when it is missing or empty.
+    public func key() -> String? {
+        let path = (keyFile as NSString).expandingTildeInPath
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+              let line = text.split(whereSeparator: \.isNewline).first?.trimmingCharacters(in: .whitespaces),
+              !line.isEmpty else { return nil }
+        return line
     }
 
     /// Always names the host: without one, wasabi finds daemons by broadcast, and an emulator
@@ -49,14 +62,22 @@ public struct AmigaReset: Equatable {
     }
 
     /// Runs the client off the main thread. `done` gets the status line text on the main queue.
-    /// `environment` nil inherits this process's environment.
+    /// `environment` nil inherits this process's environment. The key goes in WASABI_KEY, not
+    /// the arguments, so other users cannot read it from the process list.
     public func run(script: URL, environment: [String: String]? = nil, done: @escaping (String) -> Void) {
+        guard let key = key() else {
+            let text = "Reset failed: no key in \(keyFile)"
+            DispatchQueue.main.async { done(text) }
+            return
+        }
         let arguments = arguments(script: script)
+        var environment = environment ?? ProcessInfo.processInfo.environment
+        environment["WASABI_KEY"] = key
         DispatchQueue.global().async {
             let p = Process()
             p.executableURL = Self.python
             p.arguments = arguments
-            if let environment { p.environment = environment }
+            p.environment = environment
             let err = Pipe()
             p.standardError = err
             p.standardOutput = FileHandle.nullDevice
