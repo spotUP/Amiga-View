@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var keychain = Keychain.wasabi
     private(set) var settingsWindow: SettingsWindowController?
     static let settingsSavedStatus = "Settings saved"
-    static let fullScreenHint = "Press Esc or Control-Command-F to leave full screen"
+    static let fullScreenHint = "Press Esc, Command-Return or Control-Command-F to leave full screen"
     var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
     /// Replaced by tests with a monitor on a temp log.
@@ -351,6 +351,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.addItem(.separator())
         let fullScreen = view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.control, .command]
+        // Cmd-Return as well, the way emulators toggle full screen; hidden so the menu shows one item.
+        let fullScreenReturn = view.addItem(withTitle: "Toggle Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "\r")
+        fullScreenReturn.keyEquivalentModifierMask = .command
+        fullScreenReturn.isHidden = true
+        fullScreenReturn.allowsKeyEquivalentWhenHidden = true
         view.addItem(.separator())
         synergyItem = view.addItem(withTitle: "Switch Synergy on Click", action: #selector(toggleSynergy), keyEquivalent: "")
         synergyItem.target = self

@@ -98,12 +98,12 @@ Amiga-View: Settings... (cmd-,; see Settings).
 
 Amiga: Reset Amiga... (see Reset).
 
-View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, CRT Shader, Enter Full Screen (ctrl-cmd-F), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
+View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Overscan, Integer Scaling, CRT Shader, Enter Full Screen (ctrl-cmd-F or cmd-Return), Switch Synergy on Click, Sound. The window keeps the aspect ratio of the picture when resized.
 
 - Crop Overscan: shows only the area where the Amiga draws, 708x287 field pixels (the grabber's black margins on the right and bottom go away). Override the rectangle with the `cropX`, `cropY`, `cropWidth`, `cropHeight` defaults (field pixels, from the top left).
 - Integer Scaling: draws the picture at the largest whole multiple of its size that fits the window, centred on black; the normal fit when even 1x does not fit.
 - CRT Shader: a submenu with Off and nine Mega Bezel presets (Smooth Advanced Glass, Smooth Advanced, Advanced, Advanced Glass, Advanced Without Reflection, Standard Glass, Standard, Standard Without Reflection, Potato). It draws the picture through that preset, with scanlines, phosphor mask, curvature and a reflecting bezel. Standard is the default; Off shows the plain picture. The status line says "Loading CRT shader..." while a preset loads, which can take many seconds the first time. The choice is stored as `picture.crtShader` and survives a restart.
-- Enter Full Screen: standard macOS full screen. Press Esc or ctrl-cmd-F to leave it (the status line says so for 3 s on entering); keys only reach the Mac while it has the input. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
+- Enter Full Screen: standard macOS full screen. Press Esc, cmd-Return or ctrl-cmd-F to leave it (the status line says so for 3 s on entering); keys only reach the Mac while it has the input. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
 - Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`) and survives a restart.
 
 ## Toolbar

@@ -123,6 +123,15 @@ final class PictureMenuTests: XCTestCase {
         XCTAssertEqual(i.keyEquivalentModifierMask, [.control, .command])
     }
 
+    /// Cmd-Return toggles full screen too, the way emulators do, through a hidden View menu item.
+    func testCommandReturnTogglesFullScreen() throws {
+        let i = try XCTUnwrap(NSApp.mainMenu?.items.compactMap(\.submenu).flatMap(\.items)
+            .first { $0.keyEquivalent == "\r" && $0.keyEquivalentModifierMask == .command })
+        XCTAssertEqual(i.action, #selector(NSWindow.toggleFullScreen(_:)))
+        XCTAssertTrue(i.isHidden)
+        XCTAssertTrue(i.allowsKeyEquivalentWhenHidden)
+    }
+
     /// Full screen hides the window buttons: entering it says how to leave, and Esc leaves it.
     func testEscLeavesFullScreenAndEnteringSaysHow() {
         var fullScreen = false, exits = 0
