@@ -1,0 +1,514 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8392429..b6d420d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1835,6 +1835,7 @@ version = "0.12.1"
+ dependencies = [
+  "array-concat",
+  "bytemuck",
++ "librashader-cache",
+  "librashader-common",
+  "librashader-pack",
+  "librashader-preprocess",
+@@ -1848,6 +1849,8 @@ dependencies = [
+  "objc2-metal-kit",
+  "objc2-quartz-core",
+  "rayon",
++ "rmp-serde",
++ "serde",
+  "thiserror 2.0.18",
+ ]
+ 
+diff --git a/include/librashader.h b/include/librashader.h
+index ae0e8ec..64c01fa 100644
+--- a/include/librashader.h
++++ b/include/librashader.h
+@@ -743,6 +743,9 @@ typedef struct filter_chain_mtl_opt_t {
+   LIBRASHADER_API_VERSION version;
+   /// Whether or not to explicitly disable mipmap generation regardless of shader preset settings.
+   bool force_no_mipmaps;
++  /// Disable the shader object cache. Shaders will be
++  /// recompiled rather than loaded from the cache.
++  bool disable_cache;
+ } filter_chain_mtl_opt_t;
+ #endif
+ 
+diff --git a/librashader-cache/src/cache.rs b/librashader-cache/src/cache.rs
+index a6f6912..0d10421 100644
+--- a/librashader-cache/src/cache.rs
++++ b/librashader-cache/src/cache.rs
+@@ -70,6 +70,14 @@ pub(crate) mod internal {
+             return Ok(persy.clone());
+         }
+ 
++        // Persy holds an exclusive lock on the database file, so a second open from another
++        // thread fails and would delete the database below. Open it once, under a lock.
++        static OPEN_LOCK: Mutex<()> = Mutex::new(());
++        let _guard = OPEN_LOCK.lock();
++        if let Some(persy) = CACHE.get() {
++            return Ok(persy.clone());
++        }
++
+         let persy = match catch_unwind(|| {
+             Persy::open_or_create_with(
+                 &cache_dir.join("librashader.db.1"),
+diff --git a/librashader-capi/src/runtime/mtl/filter_chain.rs b/librashader-capi/src/runtime/mtl/filter_chain.rs
+index e3dd1e6..7fa131e 100644
+--- a/librashader-capi/src/runtime/mtl/filter_chain.rs
++++ b/librashader-capi/src/runtime/mtl/filter_chain.rs
+@@ -96,11 +96,14 @@ pub struct filter_chain_mtl_opt_t {
+     pub version: LIBRASHADER_API_VERSION,
+     /// Whether or not to explicitly disable mipmap generation regardless of shader preset settings.
+     pub force_no_mipmaps: bool,
++    /// Disable the shader object cache. Shaders will be
++    /// recompiled rather than loaded from the cache.
++    pub disable_cache: bool,
+ }
+ 
+ config_struct! {
+     impl FilterChainOptions => filter_chain_mtl_opt_t {
+-        0 => [force_no_mipmaps];
++        0 => [force_no_mipmaps, disable_cache];
+     }
+ }
+ 
+diff --git a/librashader-reflect/src/reflect/presets.rs b/librashader-reflect/src/reflect/presets.rs
+index 7867d09..697ef03 100644
+--- a/librashader-reflect/src/reflect/presets.rs
++++ b/librashader-reflect/src/reflect/presets.rs
+@@ -81,31 +81,47 @@ where
+     E: From<ShaderReflectError>,
+     E: From<ShaderCompileError>,
+ {
+-    let mut uniform_semantics: FastHashMap<ShortString, UniformSemantic> = Default::default();
+-    let mut texture_semantics: FastHashMap<ShortString, Semantic<TextureSemantics>> =
+-        Default::default();
+-
+     let artifacts = passes
+         .into_iter()
+         .map(|shader| {
+-            let source = &shader.data;
+-            let compiled = I::Compiler::compile(source)?;
++            let compiled = I::Compiler::compile(&shader.data)?;
+             let reflect = T::from_compilation(compiled)?;
+-
+-            for parameter in source.parameters.values() {
+-                uniform_semantics.insert(
+-                    parameter.id.clone(),
+-                    UniformSemantic::Unique(Semantic {
+-                        semantics: UniqueSemantics::FloatParameter,
+-                        index: (),
+-                    }),
+-                );
+-            }
+             Ok::<_, E>((shader, reflect))
+         })
+         .collect::<Result<Vec<(PassResource, CompilerBackend<_>)>, E>>()?;
+ 
+-    for (pass, _) in artifacts.iter() {
++    let mut semantics = preset_semantics(artifacts.iter().map(|(pass, _)| pass), textures);
++    I::Compiler::apply_mangled_semantics(&mut semantics);
++    Ok((artifacts, semantics))
++}
++
++/// Build the semantics of a shader preset from its passes and LUT textures, without
++/// compiling any pass.
++///
++/// This is the semantics map [`CompilePresetTarget::compile_preset_passes`] returns, before
++/// the shader compiler's name mangling is applied, so a runtime that caches compiled passes
++/// can reflect them without compiling the whole preset first.
++pub fn preset_semantics<'a, 'b>(
++    passes: impl Iterator<Item = &'a PassResource> + Clone,
++    textures: impl Iterator<Item = &'b TextureMeta>,
++) -> ShaderSemantics {
++    let mut uniform_semantics: FastHashMap<ShortString, UniformSemantic> = Default::default();
++    let mut texture_semantics: FastHashMap<ShortString, Semantic<TextureSemantics>> =
++        Default::default();
++
++    for pass in passes.clone() {
++        for parameter in pass.data.parameters.values() {
++            uniform_semantics.insert(
++                parameter.id.clone(),
++                UniformSemantic::Unique(Semantic {
++                    semantics: UniqueSemantics::FloatParameter,
++                    index: (),
++                }),
++            );
++        }
++    }
++
++    for pass in passes {
+         insert_pass_semantics(
+             &mut uniform_semantics,
+             &mut texture_semantics,
+@@ -122,13 +138,10 @@ where
+ 
+     insert_lut_semantics(textures, &mut uniform_semantics, &mut texture_semantics);
+ 
+-    let mut semantics = ShaderSemantics {
++    ShaderSemantics {
+         uniform_semantics,
+         texture_semantics,
+-    };
+-
+-    I::Compiler::apply_mangled_semantics(&mut semantics);
+-    Ok((artifacts, semantics))
++    }
+ }
+ 
+ /// Insert the available semantics for the input pass config into the provided semantic maps.
+diff --git a/librashader-runtime-mtl/Cargo.toml b/librashader-runtime-mtl/Cargo.toml
+index 1ce5dc8..f5c91ae 100644
+--- a/librashader-runtime-mtl/Cargo.toml
++++ b/librashader-runtime-mtl/Cargo.toml
+@@ -18,13 +18,16 @@ librashader-common = { path = "../librashader-common", features = ["metal"], ver
+ librashader-presets = { path = "../librashader-presets", version = "0.12.1" }
+ librashader-preprocess = { path = "../librashader-preprocess", version = "0.12.1" }
+ librashader-pack = { path = "../librashader-pack", version = "0.12.1" }
+-librashader-reflect = { path = "../librashader-reflect", version = "0.12.1" }
++librashader-reflect = { path = "../librashader-reflect", version = "0.12.1", features = ["serde"] }
++librashader-cache = { path = "../librashader-cache", version = "0.12.1" }
+ librashader-runtime = { path = "../librashader-runtime" , version = "0.12.1" }
+ 
+ thiserror = "2"
+ array-concat = "0.5.2"
+ bytemuck = { version = "1.12.3", features = ["derive"] }
+ rayon = { workspace = true }
++serde = { version = "1.0", features = ["derive"] }
++rmp-serde = "1.3.0"
+ 
+ [[test]]
+ name = "triangle"
+diff --git a/librashader-runtime-mtl/src/filter_chain.rs b/librashader-runtime-mtl/src/filter_chain.rs
+index df4fda2..f66cb06 100644
+--- a/librashader-runtime-mtl/src/filter_chain.rs
++++ b/librashader-runtime-mtl/src/filter_chain.rs
+@@ -3,7 +3,7 @@ use crate::draw_quad::DrawQuad;
+ use crate::error;
+ use crate::error::FilterChainError;
+ use crate::filter_pass::FilterPass;
+-use crate::graphics_pipeline::MetalGraphicsPipeline;
++use crate::graphics_pipeline::{CachedMslContext, MetalGraphicsPipeline};
+ use crate::luts::LutTexture;
+ use crate::options::{FilterChainOptionsMetal, FrameOptionsMetal};
+ use crate::samplers::SamplerSet;
+@@ -14,10 +14,12 @@ use librashader_presets::context::VideoDriver;
+ use librashader_presets::{ShaderFeatures, ShaderPreset};
+ use librashader_reflect::back::msl::MslVersion;
+ use librashader_reflect::back::targets::MSL;
+-use librashader_reflect::back::{CompileReflectShader, CompileShader};
++use librashader_reflect::back::CompileShader;
+ use librashader_reflect::front::SpirvCompilation;
+ use librashader_reflect::reflect::cross::SpirvCross;
+-use librashader_reflect::reflect::presets::{CompilePresetTarget, ShaderPassArtifact};
++use librashader_reflect::back::ShaderCompilerOutput;
++use librashader_reflect::front::{Glslang, ShaderInputCompiler};
++use librashader_reflect::reflect::presets::preset_semantics;
+ use librashader_reflect::reflect::semantics::ShaderSemantics;
+ use librashader_reflect::reflect::ReflectShader;
+ use librashader_runtime::binding::BindingUtil;
+@@ -41,32 +43,112 @@ use std::path::Path;
+ 
+ mod compile {
+     use super::*;
+-    use librashader_pack::{PassResource, TextureResource};
+-
+-    #[cfg(feature = "nightly")]
+-    pub type ShaderPassMeta =
+-        ShaderPassArtifact<impl CompileReflectShader<MSL, SpirvCompilation, SpirvCross> + Send>;
+-
+-    #[cfg(not(feature = "nightly"))]
+-    pub type ShaderPassMeta =
+-        ShaderPassArtifact<Box<dyn CompileReflectShader<MSL, SpirvCompilation, SpirvCross> + Send>>;
+-
+-    #[cfg_attr(feature = "nightly", define_opaque(ShaderPassMeta))]
+-    pub fn compile_passes(
+-        shaders: Vec<PassResource>,
+-        textures: &[TextureResource],
+-    ) -> Result<(Vec<ShaderPassMeta>, ShaderSemantics), FilterChainError> {
+-        let (passes, semantics) = MSL::compile_preset_passes::<
+-            SpirvCompilation,
+-            SpirvCross,
+-            FilterChainError,
+-        >(shaders, textures.iter().map(|t| &t.meta))?;
+-        Ok((passes, semantics))
++    use librashader_cache::{cache_shader_object, Cacheable};
++    use librashader_preprocess::ShaderSource;
++    use librashader_reflect::back::FromCompilation;
++    use librashader_reflect::front::{Glslang, ShaderInputCompiler};
++    use librashader_reflect::reflect::semantics::ShaderReflection;
++
++    /// Bump when the cached artifact layout or the compiler pipeline changes, so stale
++    /// entries from an older build are never loaded.
++    const CACHE_VERSION: &[u8] = b"librashader-runtime-mtl-0.12.1-msl-2.0.0-v2";
++
++    /// The reflected and compiled output of one pass, as stored in the shader cache.
++    ///
++    /// Compiling a pass means glslang (GLSL to SPIR-V), SPIRV-Cross reflection and
++    /// SPIRV-Cross MSL generation; together these are almost all of a preset's load time.
++    /// Caching the result skips all three on later loads of the same pass.
++    ///
++    /// Stored as MessagePack: the reflection holds halfbrown maps, whose `Deserialize`
++    /// calls `deserialize_any`, so it needs a self-describing format (bincode cannot
++    /// decode it).
++    #[derive(serde::Serialize, serde::Deserialize)]
++    pub struct CachedMslPass {
++        pub reflection: ShaderReflection,
++        pub vertex: String,
++        pub fragment: String,
++    }
++
++    impl Cacheable for CachedMslPass {
++        fn from_bytes(bytes: &[u8]) -> Option<Self> {
++            rmp_serde::from_slice(bytes).ok()
++        }
++
++        fn to_bytes(&self) -> Option<Vec<u8>> {
++            rmp_serde::to_vec(self).ok()
++        }
++    }
++
++    /// The semantics as stable text for the cache key. The maps are hash maps whose
++    /// iteration order is not guaranteed, so the entries are sorted first.
++    pub fn semantics_key(semantics: &ShaderSemantics) -> String {
++        let mut entries: Vec<String> = semantics
++            .uniform_semantics
++            .iter()
++            .map(|(name, semantic)| format!("u:{name:?}={semantic:?}"))
++            .chain(
++                semantics
++                    .texture_semantics
++                    .iter()
++                    .map(|(name, semantic)| format!("t:{name:?}={semantic:?}")),
++            )
++            .collect();
++        entries.sort_unstable();
++        entries.join("\n")
++    }
++
++    fn compile_pass(
++        index: usize,
++        source: &ShaderSource,
++        semantics: &ShaderSemantics,
++    ) -> Result<CachedMslPass, FilterChainError> {
++        let compiled: SpirvCompilation = Glslang::compile(source)?;
++        let mut reflect = <MSL as FromCompilation<SpirvCompilation, SpirvCross>>::from_compilation(
++            compiled,
++        )?;
++        let reflection = reflect.reflect(index, semantics)?;
++        let msl = reflect.compile(Some(MslVersion::new(2, 0, 0)))?;
++        Ok(CachedMslPass {
++            reflection,
++            vertex: msl.vertex,
++            fragment: msl.fragment,
++        })
++    }
++
++    /// Reflect and compile one pass, loading it from the shader cache when an entry for
++    /// the same source, pass index and semantics exists.
++    pub fn compile_pass_cached(
++        index: usize,
++        source: &ShaderSource,
++        semantics: &ShaderSemantics,
++        semantics_key: &str,
++        disable_cache: bool,
++    ) -> Result<CachedMslPass, FilterChainError> {
++        let shape = format!(
++            "{index}:{}:{}:{}",
++            source.vertex.len(),
++            source.fragment.len(),
++            semantics_key.len()
++        );
++        let keys: [&[u8]; 5] = [
++            CACHE_VERSION,
++            shape.as_bytes(),
++            source.vertex.as_bytes(),
++            source.fragment.as_bytes(),
++            semantics_key.as_bytes(),
++        ];
++        cache_shader_object(
++            "msl",
++            &keys,
++            |_| compile_pass(index, source, semantics),
++            |pass| Ok::<_, FilterChainError>(pass),
++            disable_cache,
++        )
+     }
+ }
+ 
+-use compile::{compile_passes, ShaderPassMeta};
+-use librashader_pack::{ShaderPresetPack, TextureResource};
++use compile::{compile_pass_cached, semantics_key, CachedMslPass};
++use librashader_pack::{PassResource, ShaderPresetPack, TextureResource};
+ use librashader_runtime::parameters::RuntimeParameters;
+ 
+ /// A Metal filter chain.
+@@ -175,16 +257,35 @@ impl FilterChainMetal {
+ 
+     fn init_passes(
+         device: &Retained<ProtocolObject<dyn MTLDevice>>,
+-        passes: Vec<ShaderPassMeta>,
++        passes: Vec<PassResource>,
+         semantics: &ShaderSemantics,
++        disable_cache: bool,
+     ) -> error::Result<Box<[FilterPass]>> {
+-        // todo: fix this to allow send
++        // Shader compilation is CPU-only and independent per pass, so it runs in parallel.
++        // Metal objects are still created on this thread, in pass order.
++        let semantics_key = semantics_key(semantics);
++        let compiled: Vec<error::Result<CachedMslPass>> = passes
++            .par_iter()
++            .enumerate()
++            .map(|(index, config)| {
++                compile_pass_cached(index, &config.data, semantics, &semantics_key, disable_cache)
++            })
++            .collect();
++
+         let filters: Vec<error::Result<FilterPass>> = passes
+             .into_iter()
+-            .enumerate()
+-            .map(|(index, (config, mut reflect))| {
+-                let reflection = reflect.reflect(index, semantics)?;
+-                let msl = reflect.compile(Some(MslVersion::new(2, 0, 0)))?;
++            .zip(compiled)
++            .map(|(config, compiled)| {
++                let CachedMslPass {
++                    reflection,
++                    vertex,
++                    fragment,
++                } = compiled?;
++                let msl = ShaderCompilerOutput {
++                    vertex,
++                    fragment,
++                    context: CachedMslContext,
++                };
+ 
+                 let ubo_size = reflection.ubo.as_ref().map_or(0, |ubo| ubo.size as usize);
+                 let push_size = reflection
+@@ -319,9 +420,12 @@ impl FilterChainMetal {
+         options: Option<&FilterChainOptionsMetal>,
+     ) -> error::Result<FilterChainMetal> {
+         let config = RuntimeParameters::new(&preset);
+-        let (passes, semantics) = compile_passes(preset.passes, &preset.textures)?;
++        let disable_cache = options.map_or(false, |o| o.disable_cache);
++        let mut semantics =
++            preset_semantics(preset.passes.iter(), preset.textures.iter().map(|t| &t.meta));
++        <Glslang as ShaderInputCompiler<SpirvCompilation>>::apply_mangled_semantics(&mut semantics);
+ 
+-        let filters = Self::init_passes(&device, passes, &semantics)?;
++        let filters = Self::init_passes(&device, preset.passes, &semantics, disable_cache)?;
+ 
+         let samplers = SamplerSet::new(&device)?;
+         let luts = FilterChainMetal::load_luts(&device, &cmd, preset.textures)?;
+@@ -575,3 +679,78 @@ impl FilterChainMetal {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod cache_tests {
++    use super::compile::CachedMslPass;
++    use librashader_cache::Cacheable;
++    use librashader_common::map::FastHashMap;
++    use librashader_common::shader_features::ShaderFeatures;
++    use librashader_preprocess::ShaderSource;
++    use librashader_reflect::reflect::semantics::{
++        Semantic, ShaderSemantics, UniformSemantic, UniqueSemantics,
++    };
++
++    const SHADER: &str = r#"#version 450
++#pragma parameter STRENGTH "Strength" 0.5 0.0 1.0 0.1
++layout(std140, set = 0, binding = 0) uniform UBO { mat4 MVP; };
++layout(push_constant) uniform Push { vec4 SourceSize; float STRENGTH; } params;
++#pragma stage vertex
++layout(location = 0) in vec4 Position;
++layout(location = 1) in vec2 TexCoord;
++layout(location = 0) out vec2 vTexCoord;
++void main() { gl_Position = MVP * Position; vTexCoord = TexCoord; }
++#pragma stage fragment
++layout(location = 0) in vec2 vTexCoord;
++layout(location = 0) out vec4 FragColor;
++layout(set = 0, binding = 2) uniform sampler2D Source;
++void main() {
++    FragColor = texture(Source, vTexCoord) * params.STRENGTH + params.SourceSize.x * 0.0;
++}
++"#;
++
++    /// A cached pass must decode back from its own bytes. The reflection holds halfbrown
++    /// maps whose `Deserialize` calls `deserialize_any`; a non-self-describing format such
++    /// as bincode encodes them but never decodes them, so every load recompiled.
++    #[test]
++    fn cached_pass_round_trips_through_its_bytes() {
++        let dir = std::env::temp_dir().join(format!("mtl-cache-test-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("pass.slang");
++        std::fs::write(&path, SHADER).unwrap();
++        let source = ShaderSource::load(&path, ShaderFeatures::NONE).unwrap();
++        std::fs::remove_dir_all(&dir).ok();
++
++        let mut uniform_semantics = FastHashMap::default();
++        uniform_semantics.insert(
++            "STRENGTH".into(),
++            UniformSemantic::Unique(Semantic {
++                semantics: UniqueSemantics::FloatParameter,
++                index: (),
++            }),
++        );
++        let semantics = ShaderSemantics {
++            uniform_semantics,
++            texture_semantics: FastHashMap::default(),
++        };
++
++        let pass = super::compile::compile_pass_cached(0, &source, &semantics, "test", true)
++            .unwrap();
++        assert!(!pass.reflection.meta.parameter_meta.is_empty());
++        assert!(!pass.reflection.meta.unique_meta.is_empty());
++        assert!(!pass.reflection.meta.texture_meta.is_empty());
++
++        let bytes = pass.to_bytes().expect("pass encodes");
++        let decoded = CachedMslPass::from_bytes(&bytes).expect("pass decodes from its own bytes");
++        assert_eq!(decoded.vertex, pass.vertex);
++        assert_eq!(decoded.fragment, pass.fragment);
++        assert_eq!(
++            decoded.reflection.meta.parameter_meta.len(),
++            pass.reflection.meta.parameter_meta.len()
++        );
++        assert_eq!(
++            decoded.reflection.meta.texture_meta.len(),
++            pass.reflection.meta.texture_meta.len()
++        );
++    }
++}
+diff --git a/librashader-runtime-mtl/src/graphics_pipeline.rs b/librashader-runtime-mtl/src/graphics_pipeline.rs
+index 1fa6b34..5fc4cb5 100644
+--- a/librashader-runtime-mtl/src/graphics_pipeline.rs
++++ b/librashader-runtime-mtl/src/graphics_pipeline.rs
+@@ -45,6 +45,16 @@ impl MslEntryPoint for CrossMslContext {
+     }
+ }
+ 
++/// The context of MSL loaded from the shader cache. The cache only holds SPIRV-Cross
++/// output, so the entry point is SPIRV-Cross's.
++pub struct CachedMslContext;
++
++impl MslEntryPoint for CachedMslContext {
++    fn entry_point() -> Retained<NSString> {
++        NSString::from_str("main0")
++    }
++}
++
+ impl MslEntryPoint for NagaMslContext {
+     fn entry_point() -> Retained<NSString> {
+         NSString::from_str("main_")
+diff --git a/librashader-runtime-mtl/src/options.rs b/librashader-runtime-mtl/src/options.rs
+index 08085a9..6d85957 100644
+--- a/librashader-runtime-mtl/src/options.rs
++++ b/librashader-runtime-mtl/src/options.rs
+@@ -9,4 +9,7 @@ impl_default_frame_options!(FrameOptionsMetal);
+ pub struct FilterChainOptionsMetal {
+     /// Whether or not to explicitly disable mipmap generation regardless of shader preset settings.
+     pub force_no_mipmaps: bool,
++    /// Disable the shader object cache. Shaders will be
++    /// recompiled rather than loaded from the cache.
++    pub disable_cache: bool,
+ }

@@ -55,13 +55,21 @@ static BOOL LBCheck(libra_error_t err, NSString *what, NSError **out) {
 - (nullable instancetype)initWithPresetPath:(NSString *)path
                                       queue:(id<MTLCommandQueue>)queue
                                       error:(NSError **)error {
+    return [self initWithPresetPath:path queue:queue shaderCache:YES error:error];
+}
+
+- (nullable instancetype)initWithPresetPath:(NSString *)path
+                                      queue:(id<MTLCommandQueue>)queue
+                                shaderCache:(BOOL)shaderCache
+                                      error:(NSError **)error {
     self = [super init];
     if (!self) return nil;
     libra_shader_preset_t preset = NULL;
     if (!LBCheck(libra_preset_create(path.fileSystemRepresentation, &preset),
                  @"loading preset", error)) return nil;
     struct filter_chain_mtl_opt_t opt = { .version = LIBRASHADER_CURRENT_VERSION,
-                                          .force_no_mipmaps = false };
+                                          .force_no_mipmaps = false,
+                                          .disable_cache = !shaderCache };
     BOOL ok = LBCheck(libra_mtl_filter_chain_create(&preset, queue, &opt, &_chain),
                       @"creating Metal filter chain", error);
     if (preset) libra_preset_free(&preset);
