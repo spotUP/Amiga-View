@@ -94,6 +94,16 @@ final class CaptureMenuTests: XCTestCase {
         XCTAssertTrue(options.contains(.autoHideToolbar))
     }
 
+    /// The frame rate sits in the toolbar, not on the status line over the picture.
+    func testFrameRateShowsInTheToolbar() throws {
+        let item = try XCTUnwrap(app.window.toolbar?.items.first { $0.itemIdentifier == .frameRate })
+        let field = try XCTUnwrap(item.view as? NSTextField)
+        feedFrames()
+        app.refreshStatus()
+        XCTAssertNotNil(field.stringValue.range(of: #"^[1-9]\d* FPS$"#, options: .regularExpression), field.stringValue)
+        XCTAssertFalse(app.video.status.contains("FPS"), app.video.status)
+    }
+
     func testSnapshotWritesThePicture() throws {
         try invoke("Save Snapshot")   // no frame yet
         XCTAssertTrue(files("png").isEmpty)

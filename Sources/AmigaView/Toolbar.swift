@@ -8,16 +8,19 @@ extension NSToolbarItem.Identifier {
     static let fullScreen = Self("fullScreen")
     static let resetAmiga = Self("resetAmiga")
     static let settings = Self("settings")
+    static let frameRate = Self("frameRate")
 }
 
 /// The window's toolbar: buttons for the actions people reach for most, each running the same
 /// action as its menu item. View > Hide Toolbar hides it, and the system remembers that. In full
 /// screen it hides with the menu bar (see EdgeGuard), so only the picture shows.
 extension AppDelegate: NSToolbarDelegate {
-    static let toolbarItems: [NSToolbarItem.Identifier] = [.snapshot, .record, .sound, .fullScreen, .flexibleSpace, .resetAmiga, .settings]
+    static let toolbarItems: [NSToolbarItem.Identifier] = [.snapshot, .record, .sound, .fullScreen, .flexibleSpace, .frameRate, .flexibleSpace, .resetAmiga, .settings]
 
     func buildToolbar() {
-        let toolbar = NSToolbar(identifier: "main")
+        // A new identifier whenever the items change: the autosaved configuration lists the items
+        // of the old one, so a new item would not appear.
+        let toolbar = NSToolbar(identifier: "main.2")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.autosavesConfiguration = true
@@ -43,6 +46,15 @@ extension AppDelegate: NSToolbarDelegate {
             item.target = nil
         case .resetAmiga: set(item, "Reset Amiga", "power", #selector(resetAmiga))
         case .settings: set(item, "Settings", "gearshape", #selector(openSettings))
+        case .frameRate:
+            item.label = "Frame Rate"
+            item.paletteLabel = "Frame Rate"
+            item.toolTip = "Frame Rate"
+            item.isBordered = false
+            let field = NSTextField(labelWithString: frameRateText())
+            field.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            field.textColor = .secondaryLabelColor
+            item.view = field
         default: return nil
         }
         return item
@@ -69,5 +81,10 @@ extension AppDelegate: NSToolbarDelegate {
             default: break
             }
         }
+    }
+
+    func updateFrameRateItem() {
+        let item = window.toolbar?.items.first { $0.itemIdentifier == .frameRate }
+        (item?.view as? NSTextField)?.stringValue = frameRateText()
     }
 }

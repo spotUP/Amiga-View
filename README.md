@@ -13,7 +13,7 @@ A Raspberry Pi 4 grabber runs `camserver.py` (from Up_Rough_Demo_System, `tools/
 - `GET /audio.pcm` live sound from the grabber's audio input: raw s16le, 48000 Hz, stereo (camserver `--audio-device`).
 
 On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
-`ssh -N -L 8090:localhost:8090 amigrabber` (key login, BatchMode; `amigrabber` is the Host entry in ~/.ssh/config that names the key ~/.ssh/amigrabber_ed25519) and stops it again on quit. It then reads the MJPEG stream, keeps only the newest frame, and draws it scaled 2x vertically (720x576) with nearest-neighbour scaling. When the stream drops it reconnects with backoff (0.5 s doubling to 8 s) and polls `/snapshot.png` once per second meanwhile. The status line at the bottom left shows "Connecting", "Tunnel failed: reason", "No signal", or the measured FPS.
+`ssh -N -L 8090:localhost:8090 amigrabber` (key login, BatchMode; `amigrabber` is the Host entry in ~/.ssh/config that names the key ~/.ssh/amigrabber_ed25519) and stops it again on quit. It then reads the MJPEG stream, keeps only the newest frame, and draws it scaled 2x vertically (720x576) with nearest-neighbour scaling. When the stream drops it reconnects with backoff (0.5 s doubling to 8 s) and polls `/snapshot.png` once per second meanwhile. The status line at the bottom left shows "Connecting", "Tunnel failed: reason" or "No signal", and hides while frames arrive. The measured frame rate shows in the middle of the toolbar.
 
 ## Hardware
 
@@ -49,7 +49,7 @@ What the setup needs:
 5. Amiga: start the UHCTools Synergy client with the screen name "replay", pointing at the Mac. The client reports a 680x540 screen.
 6. Amiga, optional: install wasabid from UP-Term's kit (tick wasabid in Install). It installs wasabid in `C:`, the key in `ENVARC:wasabi.key`, a block in `S:User-Startup`, and listens on port 1234. Use it only on a private network and never forward port 1234. Copy the key to `~/.config/up-term/replay-wasabi.key` on the Mac.
 7. Mac: build and open Amiga-View (see Build and run). Open Amiga-View > Settings... and set the Amiga address (192.168.0.74) and port (1234), then enter the wasabid key. The picture needs no setting: the app starts the tunnel by itself.
-8. Check: the status line shows the frame rate, the picture is the Amiga's screen, and moving the pointer across the right edge of the Mac screen gives the Amiga the keyboard and mouse.
+8. Check: the toolbar shows the frame rate, the picture is the Amiga's screen, and moving the pointer across the right edge of the Mac screen gives the Amiga the keyboard and mouse.
 
 ## Build and run
 
@@ -110,14 +110,14 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Oversc
 
 ## Toolbar
 
-The window's toolbar has Save Snapshot, Start/Stop Recording, Sound, Enter Full Screen, Reset Amiga and Settings; each runs the same action as its menu item, and the Recording and Sound buttons show the current state. Right-click the toolbar to customise it. In full screen it hides with the menu bar and shows when the pointer touches the top edge.
+The window's toolbar has Save Snapshot, Start/Stop Recording, Sound, Enter Full Screen, Reset Amiga and Settings; each runs the same action as its menu item, and the Recording and Sound buttons show the current state. The middle of the toolbar shows the measured frame rate (`25 FPS`, with "snapshot polling" added while the stream is down). Right-click the toolbar to customise it. In full screen it hides with the menu bar and shows when the pointer touches the top edge.
 
 ## Snapshot and recording
 
 The File menu saves what the window shows.
 
 - **Save Snapshot** (cmd-S) writes the newest frame as a PNG to the Desktop, named `Amiga-View 2026-10-27 at 14.03.09.png`. It is the displayed picture: every line doubled (720x576), cropped when Crop Overscan is on.
-- **Start Recording** / **Stop Recording** (cmd-R) writes `Amiga-View <date> at <time>.mov` to Movies: H.264 video at the displayed size, plus AAC sound when Sound is on. Picture times follow frame arrival, so a stalled stream shows as a pause; sound is timed by sample count from the first frame. The status line shows `Recording 00:12` and the frame rate. Quitting finishes the file. A frame backlog is dropped rather than slowing the display.
+- **Start Recording** / **Stop Recording** (cmd-R) writes `Amiga-View <date> at <time>.mov` to Movies: H.264 video at the displayed size, plus AAC sound when Sound is on. Picture times follow frame arrival, so a stalled stream shows as a pause; sound is timed by sample count from the first frame. The status line shows `Recording 00:12`. Quitting finishes the file. A frame backlog is dropped rather than slowing the display.
 
 ## Reset
 

@@ -259,20 +259,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let recording = recorder.map { _ in "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt))" }
         let loading = shaderLoading ? "Loading CRT shader..." : nil
         video.status = [recording, loading, statusMessage()].compactMap { $0 }.joined(separator: "\n")
+        updateFrameRateItem()
     }
 
-    private func statusMessage() -> String {
+    /// The measured frame rate, shown in the toolbar.
+    func frameRateText() -> String {
+        let fps = fpsMeter.fps(at: Date.timeIntervalSinceReferenceDate)
+        let mode = client?.usingSnapshotFallback == true ? " (snapshot polling)" : ""
+        return String(format: "%.0f FPS%@", fps, mode)
+    }
+
+    /// Nil while frames arrive: the frame rate is in the toolbar, so the status line stays clear.
+    private func statusMessage() -> String? {
         if let f = flash {
             if ProcessInfo.processInfo.systemUptime < f.until { return f.text }
             flash = nil
         }
         if let text = deskflow.overrideStatus { return text }
         if SynergySwitch.isEnabled() && !accessibilityTrusted { return SynergySwitch.untrustedStatus }
-        let fps = fpsMeter.fps(at: Date.timeIntervalSinceReferenceDate)
-        if let last = lastFrame, Date().timeIntervalSince(last) < 3 {
-            let mode = client?.usingSnapshotFallback == true ? " (snapshot polling)" : ""
-            return String(format: "%.0f FPS%@", fps, mode)
-        }
+        if let last = lastFrame, Date().timeIntervalSince(last) < 3 { return nil }
         return lastFrame != nil ? "No signal" : baseStatus
     }
 

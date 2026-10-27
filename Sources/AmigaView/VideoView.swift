@@ -179,7 +179,7 @@ final class VideoView: NSView {
     }
 
     var status: String = "" {
-        didSet { label.stringValue = status.split(separator: "\n").map { " \($0) " }.joined(separator: "\n"); needsLayout = true }
+        didSet { label.stringValue = status.split(separator: "\n").map { " \($0) " }.joined(separator: "\n"); label.isHidden = status.isEmpty; needsLayout = true }
     }
 
     override func layout() {
