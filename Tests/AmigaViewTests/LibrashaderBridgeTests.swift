@@ -1,12 +1,17 @@
 import Metal
 import XCTest
 import LibrashaderBridge
+@testable import AmigaViewCore
 
 /// Spike: can a librashader Metal chain load a Mega Bezel reflection preset and render frames?
 final class LibrashaderBridgeTests: XCTestCase {
-    static let preset = NSString(string: "~/Code/UpRough/Up_Rough_Demo_System/web/maker/src-tauri/shaders/slang/bezel/Mega_Bezel/Presets/MBZ__3__STD.slangp").expandingTildeInPath
+    /// The Mega Bezel preset from build/shaders, found the way the app finds it under swift build.
+    static let preset = CRTShader.shadersURL(bundle: Bundle(for: LibrashaderBridgeTests.self))
+        .appendingPathComponent(CRTShader.standard.presetPath).path
 
     func testMegaBezelReflectionPresetRendersThreeFrames() throws {
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: Self.preset),
+                          "\(Self.preset) is missing; run scripts/fetch-shaders.sh")
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             throw XCTSkip("no Metal device")
         }
