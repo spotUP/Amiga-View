@@ -102,7 +102,7 @@ final class VideoView: NSView {
     private let loadQueue = DispatchQueue(label: "CRT shader load", qos: .userInitiated)
 
     /// The preset to filter the picture with; nil shows the plain picture. Loads on a background
-    /// queue and draws plain meanwhile; a load for a preset that is no longer wanted is skipped, or
+    /// queue and draws black meanwhile (a failed load shows the plain picture); a load for a preset that is no longer wanted is skipped, or
     /// dropped when already running. Choosing the preset that is active, loading or loaded is a no-op;
     /// a failed one is tried again.
     var shaderPreset: URL? {
@@ -113,6 +113,7 @@ final class VideoView: NSView {
             chain = nil
             guard let url = shaderPreset, let renderer else { shaderState = .off; draw(); return }
             shaderState = .loading
+            draw()
             let generation = loadGeneration, queue = renderer.queue, wanted = wantedGeneration, load = chainLoader
             loadQueue.async { [weak self] in
                 guard wanted.value == generation else { return }
@@ -165,7 +166,10 @@ final class VideoView: NSView {
 
     private func draw() {
         syncDrawableSize()
-        guard let renderer, let image else { return }
+        guard let renderer else { return }
+        // The unfiltered picture would flash up for the seconds the preset compiles.
+        if shaderState == .loading { renderer.clear(metalLayer); return }
+        guard let image else { return }
         renderer.render(field: image, crop: crop, rect: pictureRect, chain: chain, frameCount: frameCount, to: metalLayer)
     }
 

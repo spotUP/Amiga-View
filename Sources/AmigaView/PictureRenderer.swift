@@ -92,6 +92,30 @@ final class PictureRenderer {
         return device.makeTexture(descriptor: d)
     }
 
+    /// A pass that clears `texture` to black before drawing.
+    private static func blackPass(_ texture: MTLTexture) -> MTLRenderPassDescriptor {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+        return pass
+    }
+
+    /// Presents an all-black drawable (the picture is hidden while a shader loads).
+    @discardableResult
+    func clear(_ layer: CAMetalLayer) -> Bool {
+        guard layer.drawableSize.width >= 1, layer.drawableSize.height >= 1,
+              let cb = queue.makeCommandBuffer(), let drawable = layer.nextDrawable(),
+              let enc = cb.makeRenderCommandEncoder(descriptor: Self.blackPass(drawable.texture)) else { return false }
+        enc.endEncoding()
+        cb.present(drawable)
+        cb.commit()
+        lastTexture = drawable.texture
+        lastCommandBuffer = cb
+        return true
+    }
+
     /// Draws `crop` of `field` into `rect` (pixels) of the layer's next drawable. With a `chain`
     /// the picture first goes through it at `ViewGeometry.chainSize`, then one linear pass scales
     /// it to `rect`; a chain error shows the plain picture for that frame. Returns false when
@@ -117,12 +141,7 @@ final class PictureRenderer {
                 picture = target; filter = linear
             }
         }
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = drawable.texture
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        pass.colorAttachments[0].storeAction = .store
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: Self.blackPass(drawable.texture)) else { return false }
         enc.setViewport(MTLViewport(originX: Double(rect.minX), originY: Double(rect.minY), width: Double(rect.width),
                                     height: Double(rect.height), znear: 0, zfar: 1))
         enc.setRenderPipelineState(pipeline)

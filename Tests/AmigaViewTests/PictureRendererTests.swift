@@ -127,4 +127,32 @@ final class PictureRendererTests: XCTestCase {
         XCTAssertEqual(video.shaderState, .ready)
         XCTAssertEqual(try XCTUnwrap(video.chain).parameter("HSM_INTRO_WHEN_TO_SHOW")?.floatValue, 0)
     }
+
+    /// While a preset compiles the view stays black, also for Amiga frames that arrive meanwhile; the
+    /// unfiltered picture must not flash up before the shader applies.
+    func testPictureIsHiddenWhileTheShaderLoads() throws {
+        let video = VideoView(frame: NSRect(x: 0, y: 0, width: 720, height: 576))
+        let renderer = try XCTUnwrap(video.renderer, "no Metal device")
+        func centre() throws -> [UInt8] {
+            try XCTUnwrap(renderer.lastCommandBuffer).waitUntilCompleted()
+            let t = try XCTUnwrap(renderer.lastTexture)
+            var px = [UInt8](repeating: 0, count: 4)
+            t.getBytes(&px, bytesPerRow: 4, from: MTLRegionMake2D(t.width / 2, t.height / 2, 1, 1), mipmapLevel: 0)
+            return px
+        }
+        let release = DispatchSemaphore(value: 0)
+        video.chainLoader = { path, queue in release.wait(); return try LBFilterChain(presetPath: path, queue: queue) }
+        video.image = try field()
+        XCTAssertNotEqual(Array(try centre()[0..<3]), [0, 0, 0])
+        video.shaderPreset = Self.preset
+        XCTAssertEqual(video.shaderState, .loading)
+        XCTAssertEqual(Array(try centre()[0..<3]), [0, 0, 0])
+        video.image = try field()
+        XCTAssertEqual(Array(try centre()[0..<3]), [0, 0, 0])
+        release.signal()
+        let deadline = Date().addingTimeInterval(30)
+        while video.chain == nil, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        XCTAssertEqual(video.shaderState, .ready)
+        XCTAssertNotEqual(Array(try centre()[0..<3]), [0, 0, 0])
+    }
 }
