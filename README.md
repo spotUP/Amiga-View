@@ -121,7 +121,7 @@ The File menu saves what the window shows.
 
 ## Reset
 
-Amiga > Reset Amiga... asks first, then reboots the A1200 through wasabid, the daemon running on it (its REBOOT verb calls ColdReboot). Sending Ctrl-Amiga-Amiga over Synergy does not work: that reset is wired in the A1200's keyboard hardware, and keys that come over the network never pass through it.
+Amiga > Reset Amiga... asks first, then reboots the A1200 through wasabid, the daemon running on it (its REBOOT verb calls ColdReboot). Ctrl-Amiga-Amiga over Synergy also resets: the Synergy client on the Amiga watches for Ctrl-LeftAmiga-RightAmiga and calls exec.library/ColdReboot() itself. Deskflow on the Mac does not tell the left and right Command keys apart (deskflow/deskflow#5098), so Ctrl-Cmd-Cmd arrives as Ctrl-LeftAmiga-LeftAmiga and nothing happens. The client maps F12 to RightAmiga as a workaround: press Ctrl-Cmd-F12 while the Amiga has the input.
 
 wasabid is optional: without it everything else works, and only Reset fails. It needs wasabid running on the A1200 (UP-Term installs it, see its kit's Install) and `/usr/bin/python3` on the Mac (part of the Command Line Tools; macOS offers to install them on first use).
 
