@@ -41,13 +41,6 @@ public enum ViewGeometry {
         return s.width / s.height
     }
 
-    /// `CALayer.contentsRect` (unit square, origin at the bottom-left of the image) for a crop
-    /// given in field pixels from the top-left.
-    public static func contentsRect(for crop: CGRect) -> CGRect {
-        CGRect(x: crop.minX / fieldSize.width, y: (fieldSize.height - crop.maxY) / fieldSize.height,
-               width: crop.width / fieldSize.width, height: crop.height / fieldSize.height)
-    }
-
     /// Largest rectangle with the aspect of `content`, centred in `bounds`.
     public static func fit(in bounds: CGSize, content: CGSize = actualSize) -> CGRect {
         guard bounds.width > 0, bounds.height > 0, content.width > 0, content.height > 0 else { return .zero }
@@ -70,13 +63,26 @@ public enum ViewGeometry {
                       width: size.width, height: size.height)
     }
 
-    /// Share of black in the dark scanline rows.
-    public static let scanlineDarkness: CGFloat = 0.35
+    /// Tallest output the CRT shader chain renders at, in pixels; the result is scaled to the
+    /// drawable with one linear pass. Mega Bezel at 1440x1080 takes ~11.5 ms a frame (50 Hz budget:
+    /// 20 ms) and a Retina full screen has ~4x the pixels.
+    public static let chainMaxHeight: CGFloat = 1080
 
-    /// Black alpha (0...1) of each of the `2 * fieldLines` display rows, top to bottom: the first
-    /// row of every field line is clear, the second dark.
-    public static func scanlineAlphas(fieldLines: Int) -> [CGFloat] {
-        (0..<max(fieldLines, 0) * Int(verticalScale)).map { $0 % 2 == 1 ? scanlineDarkness : 0 }
+    /// Where the picture is drawn in the drawable, in pixels: `crop` fitted into `bounds` (points)
+    /// with `integerScaling` applied in points, then scaled by the backing `scale`. This is the
+    /// viewport of the plain blit and of the shader chain's final scale pass.
+    public static func pictureRect(in bounds: CGSize, scale: CGFloat, crop: CGRect, integerScaling: Bool) -> CGRect {
+        let content = displaySize(of: crop)
+        let r = integerScaling ? integerFit(in: bounds, content: content) : fit(in: bounds, content: content)
+        return CGRect(x: (r.minX * scale).rounded(), y: (r.minY * scale).rounded(),
+                      width: (r.width * scale).rounded(), height: (r.height * scale).rounded())
+    }
+
+    /// Size the shader chain renders at for a picture of `rect`: `rect` itself, or scaled down to
+    /// `chainMaxHeight` high with the aspect kept.
+    public static func chainSize(for rect: CGSize) -> CGSize {
+        guard rect.width > 0, rect.height > chainMaxHeight else { return rect }
+        return CGSize(width: (rect.width * chainMaxHeight / rect.height).rounded(), height: chainMaxHeight)
     }
 
     /// The picture as displayed: `crop` (field pixels) cut out of the field and every line doubled

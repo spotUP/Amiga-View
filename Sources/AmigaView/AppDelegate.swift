@@ -32,6 +32,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var synergyItem: NSMenuItem!
     private var soundItem: NSMenuItem!
     private var pictureItems: [PictureOption: NSMenuItem] = [:]
+    private var shaderItems: [CRTShader?: NSMenuItem] = [:]
+    /// Folder holding the Mega Bezel presets; tests point it at fixtures.
+    lazy var shadersURL = CRTShader.shadersURL()
+    /// "Loading CRT shader..." while a preset loads.
+    private var shaderLoading = false
     /// Posts the edge crossing; replaced by tests.
     lazy var performSwitch: () -> Void = { [weak self] in self?.postEdgeCrossing() }
     /// Full screen state and exit. Injected so tests need no real full-screen transition.
@@ -70,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         accessibilityTrusted = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
         video.onClick = { [weak self] in self?.switchSynergy(clickAt: $0) }
+        applyShader()
         NSApp.activate(ignoringOtherApps: true)
         refreshStatus()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refreshStatus() }
@@ -251,7 +257,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         deskflow.poll()
         // The recording line sits above whatever else is shown, so a running recording is never hidden.
         let recording = recorder.map { _ in "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt))" }
-        video.status = [recording, statusMessage()].compactMap { $0 }.joined(separator: "\n")
+        let loading = shaderLoading ? "Loading CRT shader..." : nil
+        video.status = [recording, loading, statusMessage()].compactMap { $0 }.joined(separator: "\n")
     }
 
     private func statusMessage() -> String {
@@ -279,6 +286,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           backing: .buffered, defer: false)
         window.title = "Amiga-View"
         window.contentView = video
+        video.onShaderState = { [weak self] state in
+            guard let self else { return }
+            self.shaderLoading = state == .loading
+            if case .failed(let reason) = state { self.showFlash("CRT shader failed: \(reason)") } else { self.refreshStatus() }
+        }
         window.initialFirstResponder = video
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.isReleasedWhenClosed = false
@@ -327,14 +339,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alwaysOnTopItem.target = self
         alwaysOnTopItem.state = window.level == .floating ? .on : .off
         view.addItem(.separator())
-        for (option, title) in [(PictureOption.cropOverscan, "Crop Overscan"), (.integerScaling, "Integer Scaling"),
-                                (.scanlines, "Scanlines")] {
+        for (option, title) in [(PictureOption.cropOverscan, "Crop Overscan"), (.integerScaling, "Integer Scaling")] {
             let item = view.addItem(withTitle: title, action: #selector(togglePicture(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = option
             item.state = option.isEnabled(in: defaults) ? .on : .off
             pictureItems[option] = item
         }
+        let shaderItem = view.addItem(withTitle: "CRT Shader", action: nil, keyEquivalent: "")
+        shaderItem.submenu = buildShaderMenu()
+        view.addItem(.separator())
         let fullScreen = view.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.control, .command]
         view.addItem(.separator())
@@ -354,6 +368,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = main
     }
 
+    private func buildShaderMenu() -> NSMenu {
+        let menu = NSMenu(title: "CRT Shader")
+        shaderItems = [:]
+        let off = menu.addItem(withTitle: "Off", action: #selector(selectShader(_:)), keyEquivalent: "")
+        off.target = self
+        shaderItems[nil] = off
+        menu.addItem(.separator())
+        for shader in CRTShader.allCases {
+            let item = menu.addItem(withTitle: shader.title, action: #selector(selectShader(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = shader
+            shaderItems[shader] = item
+        }
+        for (shader, item) in shaderItems { item.state = shader == CRTShader.selected(in: defaults) ? .on : .off }
+        return menu
+    }
+
+    @objc private func selectShader(_ sender: NSMenuItem) {
+        CRTShader.select(sender.representedObject as? CRTShader, in: defaults)
+        for item in shaderItems.values { item.state = item === sender ? .on : .off }
+        applyShader()
+    }
+
+    /// Points the view at the chosen preset (or none) and says in the status line while it loads.
+    private func applyShader() {
+        video.shaderPreset = CRTShader.selected(in: defaults).map { shadersURL.appendingPathComponent($0.presetPath) }
+    }
+
     @objc private func actualSize() { window.setContentSize(ViewGeometry.size(scale: 1)) }
     @objc private func doubleSize() { window.setContentSize(ViewGeometry.size(scale: 2)) }
 
@@ -363,7 +405,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let crop = currentCrop
         video.crop = crop
         video.integerScaling = PictureOption.integerScaling.isEnabled(in: defaults)
-        video.scanlines = PictureOption.scanlines.isEnabled(in: defaults)
         let size = ViewGeometry.displaySize(of: crop)
         window.contentAspectRatio = size
         window.contentMinSize = NSSize(width: size.width / 2, height: size.height / 2)

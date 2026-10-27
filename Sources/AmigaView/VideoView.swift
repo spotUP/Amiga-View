@@ -1,21 +1,21 @@
 import AppKit
 import AmigaViewCore
+import LibrashaderBridge
 
-/// Shows the newest frame, aspect-fitted, with nearest-neighbour scaling, plus a status line.
+/// Shows the newest frame, aspect-fitted, on a Metal layer (see PictureRenderer), plus a status line.
 final class VideoView: NSView {
-    let videoLayer = CALayer()
-    /// Darkens the second display row of every field line; present only while Scanlines is on.
-    let scanlineLayer = CALayer()
     private let label = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
-        videoLayer.magnificationFilter = .nearest
-        videoLayer.minificationFilter = .linear
-        videoLayer.contentsGravity = .resize
-        layer?.addSublayer(videoLayer)
+        let layer = metalLayer
+        layer.backgroundColor = NSColor.black.cgColor
+        layer.pixelFormat = .bgra8Unorm
+        // Not framebuffer-only: tests read the drawable back.
+        layer.framebufferOnly = false
+        layer.isOpaque = true
+        if let renderer { layer.device = renderer.device }
         label.textColor = .white
         label.backgroundColor = NSColor.black.withAlphaComponent(0.6)
         label.drawsBackground = true
@@ -55,59 +55,93 @@ final class VideoView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    /// The newest field as decoded; snapshots and recordings read it.
     var image: CGImage? {
         didSet {
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            videoLayer.contents = image
-            CATransaction.commit()
+            frameCount &+= 1
+            draw()
         }
     }
 
     /// The part of the field shown, in field pixels (see ViewGeometry.cropRect).
     var crop = ViewGeometry.fullField {
-        didSet { applyPicture() }
+        didSet { needsLayout = true; draw() }
     }
 
     var integerScaling = false {
-        didSet { needsLayout = true }
-    }
-
-    var scanlines = false {
-        didSet { applyPicture() }
+        didSet { needsLayout = true; draw() }
     }
 
     /// Where the video is drawn, in view coordinates.
-    var videoFrame: CGRect { videoLayer.frame }
-
-    private func applyPicture() {
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        videoLayer.contentsRect = ViewGeometry.contentsRect(for: crop)
-        if scanlines {
-            scanlineLayer.contents = Self.scanlineImage(fieldLines: Int(crop.height))
-            scanlineLayer.magnificationFilter = .nearest
-            scanlineLayer.minificationFilter = .nearest
-            scanlineLayer.contentsGravity = .resize
-            if scanlineLayer.superlayer == nil { layer?.insertSublayer(scanlineLayer, above: videoLayer) }
-        } else {
-            scanlineLayer.removeFromSuperlayer()
-            scanlineLayer.contents = nil
-        }
-        CATransaction.commit()
-        needsLayout = true
+    var videoFrame: CGRect {
+        let content = ViewGeometry.displaySize(of: crop)
+        return integerScaling ? ViewGeometry.integerFit(in: bounds.size, content: content)
+                              : ViewGeometry.fit(in: bounds.size, content: content)
     }
 
-    /// One pixel wide, two rows per field line, black with the alphas of ViewGeometry.scanlineAlphas.
-    static func scanlineImage(fieldLines: Int) -> CGImage? {
-        let alphas = ViewGeometry.scanlineAlphas(fieldLines: fieldLines)
-        guard !alphas.isEmpty else { return nil }
-        guard let ctx = CGContext(data: nil, width: 1, height: alphas.count, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        else { return nil }
-        for (i, a) in alphas.enumerated() {   // row 0 is the top; CGContext's origin is the bottom
-            ctx.setFillColor(CGColor(gray: 0, alpha: a))
-            ctx.fill(CGRect(x: 0, y: alphas.count - 1 - i, width: 1, height: 1))
+    // MARK: CRT shader
+
+    enum ShaderState: Equatable { case off, loading, ready, failed(String) }
+
+    private(set) var shaderState = ShaderState.off {
+        didSet { if shaderState != oldValue { onShaderState?(shaderState) } }
+    }
+    /// Called on the main queue whenever the shader state changes.
+    var onShaderState: ((ShaderState) -> Void)?
+    /// Test sentinel and measurement hook: the loaded chain, nil while off, loading or failed.
+    private(set) var chain: LBFilterChain?
+    private var loadGeneration = 0
+    /// A serial queue: the 15 s cold load must not run beside another load of the same process.
+    private let loadQueue = DispatchQueue(label: "CRT shader load", qos: .userInitiated)
+
+    /// The preset to filter the picture with; nil shows the plain picture. Loads on a background
+    /// queue and draws plain meanwhile; a result for a preset that is no longer wanted is dropped.
+    var shaderPreset: URL? {
+        didSet {
+            loadGeneration += 1
+            chain = nil
+            guard let url = shaderPreset, let renderer else { shaderState = .off; draw(); return }
+            shaderState = .loading
+            let generation = loadGeneration, queue = renderer.queue
+            loadQueue.async { [weak self] in
+                let result = Result { try LBFilterChain(presetPath: url.path, queue: queue) }
+                DispatchQueue.main.async {
+                    guard let self, generation == self.loadGeneration else { return }
+                    switch result {
+                    case .success(let c): self.chain = c; self.shaderState = .ready
+                    case .failure(let e): self.shaderState = .failed(e.localizedDescription)
+                    }
+                    self.draw()
+                }
+            }
         }
-        return ctx.makeImage()
+    }
+
+    // MARK: Drawing
+
+    let renderer = PictureRenderer()
+    /// Amiga frames that have arrived; the shader's timing follows it, not the display refresh.
+    private var frameCount: UInt = 0
+
+    var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
+
+    override func makeBackingLayer() -> CALayer { CAMetalLayer() }
+
+    private var scale: CGFloat { window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1 }
+
+    /// Where the picture is drawn in the drawable, in pixels.
+    var pictureRect: CGRect {
+        ViewGeometry.pictureRect(in: bounds.size, scale: scale, crop: crop, integerScaling: integerScaling)
+    }
+
+    private func draw() {
+        guard let renderer, let image else { return }
+        renderer.render(field: image, crop: crop, rect: pictureRect, chain: chain, frameCount: frameCount, to: metalLayer)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
     }
 
     var status: String = "" {
@@ -116,12 +150,10 @@ final class VideoView: NSView {
 
     override func layout() {
         super.layout()
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        let content = ViewGeometry.displaySize(of: crop)
-        videoLayer.frame = integerScaling ? ViewGeometry.integerFit(in: bounds.size, content: content)
-                                          : ViewGeometry.fit(in: bounds.size, content: content)
-        scanlineLayer.frame = videoLayer.frame
-        CATransaction.commit()
+        let layer = metalLayer
+        layer.contentsScale = scale
+        layer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        draw()
         label.sizeToFit()
         label.frame.origin = NSPoint(x: 8, y: 8)
     }

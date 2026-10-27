@@ -23,11 +23,6 @@ final class PictureTests: XCTestCase {
         XCTAssertEqual(ViewGeometry.displaySize(of: crop), CGSize(width: 708, height: 574))
         XCTAssertEqual(ViewGeometry.aspect(of: crop), 708.0 / 574.0, accuracy: 1e-9)
         XCTAssertEqual(ViewGeometry.aspect(of: ViewGeometry.fullField), ViewGeometry.aspect, accuracy: 1e-9)
-        // y counts from the bottom of the image: dropping the last field line leaves the bottom edge 1/288 up.
-        let r = ViewGeometry.contentsRect(for: crop)
-        XCTAssertEqual(r.minX, 0); XCTAssertEqual(r.width, 708.0 / 720, accuracy: 1e-9)
-        XCTAssertEqual(r.minY, 1.0 / 288, accuracy: 1e-9); XCTAssertEqual(r.height, 287.0 / 288, accuracy: 1e-9)
-        XCTAssertEqual(ViewGeometry.contentsRect(for: ViewGeometry.fullField), CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
     func testFitUsesContentAspect() {
@@ -53,10 +48,37 @@ final class PictureTests: XCTestCase {
                        CGRect(x: 42, y: 26, width: 1416, height: 1148))
     }
 
-    func testScanlineRows() {
-        XCTAssertEqual(ViewGeometry.scanlineAlphas(fieldLines: 3), [0, 0.35, 0, 0.35, 0, 0.35])
-        XCTAssertEqual(ViewGeometry.scanlineAlphas(fieldLines: 287).count, 574)
-        XCTAssertEqual(ViewGeometry.scanlineAlphas(fieldLines: 0), [])
+    /// The viewport the picture is drawn in: crop and Integer Scaling in points, scaled to pixels.
+    func testPictureRect() {
+        let full = ViewGeometry.fullField, cropped = ViewGeometry.defaultCrop
+        // Fitted, Retina: the 720x576 picture fills a 1000x900-point view at width, centred in height.
+        XCTAssertEqual(ViewGeometry.pictureRect(in: CGSize(width: 1000, height: 900), scale: 2, crop: full, integerScaling: false),
+                       CGRect(x: 0, y: 100, width: 2000, height: 1600))
+        // Cropped and integer: 708x574 at 2x in 1500x1200 points is the integerFit rect, doubled.
+        XCTAssertEqual(ViewGeometry.pictureRect(in: CGSize(width: 1500, height: 1200), scale: 2, crop: cropped, integerScaling: true),
+                       CGRect(x: 84, y: 52, width: 2832, height: 2296))
+        XCTAssertEqual(ViewGeometry.pictureRect(in: .zero, scale: 2, crop: full, integerScaling: false), .zero)
+    }
+
+    /// The chain renders at the picture size up to 1080 pixels high, then at 1080 with the aspect kept.
+    func testChainSizeIsCappedAndKeepsAspect() {
+        XCTAssertEqual(ViewGeometry.chainSize(for: CGSize(width: 1440, height: 1080)), CGSize(width: 1440, height: 1080))
+        XCTAssertEqual(ViewGeometry.chainSize(for: CGSize(width: 720, height: 576)), CGSize(width: 720, height: 576))
+        XCTAssertEqual(ViewGeometry.chainSize(for: CGSize(width: 2880, height: 2160)), CGSize(width: 1440, height: 1080))
+        XCTAssertEqual(ViewGeometry.chainSize(for: CGSize(width: 2832, height: 2296)).height, 1080)
+        XCTAssertEqual(ViewGeometry.chainSize(for: CGSize(width: 2832, height: 2296)).width,
+                       (2832.0 * 1080 / 2296).rounded())
+    }
+
+    func testCRTShaderChoiceIsStoredAndOffByDefault() {
+        let d = store()
+        XCTAssertNil(CRTShader.selected(in: d))
+        CRTShader.select(.standard, in: d)
+        XCTAssertEqual(CRTShader.selected(in: d), .standard)
+        CRTShader.select(nil, in: d)
+        XCTAssertNil(CRTShader.selected(in: d))
+        XCTAssertEqual(CRTShader.allCases.count, 9)
+        XCTAssertEqual(Set(CRTShader.allCases.map(\.title)).count, 9)
     }
 
     func testPictureOptionsAreStoredAndOffByDefault() {

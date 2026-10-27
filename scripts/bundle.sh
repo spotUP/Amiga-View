@@ -19,6 +19,9 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
 # wasabi client for Amiga > Reset Amiga... (vendored, see Resources/wasabi/VENDORED.md)
 cp Resources/wasabi/wasabi.py "$APP/Contents/Resources/wasabi.py"
+# Mega Bezel shader presets for View > CRT Shader, fetched by scripts/fetch-shaders.sh
+[ -d build/shaders ] || scripts/fetch-shaders.sh
+cp -R build/shaders "$APP/Contents/Resources/shaders"
 rm -rf build/AppIcon.iconset
 swift scripts/make-icon.swift build/AppIcon.iconset
 iconutil -c icns build/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"

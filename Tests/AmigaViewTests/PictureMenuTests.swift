@@ -1,4 +1,5 @@
 import AppKit
+import Metal
 import XCTest
 @testable import AmigaView
 @testable import AmigaViewCore
@@ -36,11 +37,11 @@ final class PictureMenuTests: XCTestCase {
     func testCropAndIntegerScaling() throws {
         let video = app.video, window = app.window!
         window.setContentSize(NSSize(width: 1500, height: 1200))
-        XCTAssertEqual(video.videoLayer.contentsRect, CGRect(x: 0, y: 0, width: 1, height: 1))
+        XCTAssertEqual(video.crop, ViewGeometry.fullField)
         XCTAssertEqual(window.contentAspectRatio, ViewGeometry.actualSize)
 
         try invoke("Crop Overscan")
-        XCTAssertEqual(video.videoLayer.contentsRect, ViewGeometry.contentsRect(for: ViewGeometry.defaultCrop))
+        XCTAssertEqual(video.crop, ViewGeometry.defaultCrop)
         XCTAssertEqual(window.contentAspectRatio, CGSize(width: 708, height: 574))
         XCTAssertEqual(try item("Crop Overscan").state, .on)
         XCTAssertTrue(PictureOption.cropOverscan.isEnabled(in: app.defaults))
@@ -54,21 +55,64 @@ final class PictureMenuTests: XCTestCase {
         XCTAssertEqual(video.videoFrame, CGRect(x: 42, y: 26, width: 1416, height: 1148))
 
         try invoke("Integer Scaling"); try invoke("Crop Overscan")
-        XCTAssertEqual(video.videoLayer.contentsRect, CGRect(x: 0, y: 0, width: 1, height: 1))
+        XCTAssertEqual(video.crop, ViewGeometry.fullField)
         XCTAssertEqual(window.contentAspectRatio, ViewGeometry.actualSize)
     }
 
-    func testScanlinesLayer() throws {
-        let video = app.video
-        XCTAssertNil(video.scanlineLayer.superlayer)
-        try invoke("Scanlines")
-        XCTAssertTrue(video.scanlineLayer.superlayer === video.layer)
-        XCTAssertEqual((video.scanlineLayer.contents as! CGImage).height, 576)
-        XCTAssertEqual(video.scanlineLayer.frame, video.videoLayer.frame)
-        try invoke("Crop Overscan")
-        XCTAssertEqual((video.scanlineLayer.contents as! CGImage).height, 574)
-        try invoke("Scanlines")
-        XCTAssertNil(video.scanlineLayer.superlayer)
+    private func shaderItem(_ title: String) throws -> NSMenuItem {
+        let menu = try XCTUnwrap(try item("CRT Shader").submenu)
+        return try XCTUnwrap(menu.items.first { $0.title == title }, title)
+    }
+
+    private func readPixel(_ video: VideoView) throws -> [UInt8] {
+        let r = try XCTUnwrap(video.renderer)
+        try XCTUnwrap(r.lastCommandBuffer).waitUntilCompleted()
+        let t = try XCTUnwrap(r.lastTexture)
+        var px = [UInt8](repeating: 0, count: 4)
+        t.getBytes(&px, bytesPerRow: 4, from: MTLRegionMake2D(t.width / 2, t.height / 2, 1, 1), mipmapLevel: 0)
+        return px
+    }
+
+    /// Reachability: the CRT Shader menu item loads a preset, the next Amiga frame goes through the
+    /// librashader chain (frameCallCount is the sentinel), and the drawn pixel differs from the plain
+    /// picture. The fixture preset is one pass that inverts the colour.
+    func testCRTShaderMenuDrivesTheFilterChain() throws {
+        try XCTSkipIf(app.video.renderer == nil, "no Metal device")
+        app.shadersURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/shaders")
+        app.window.setContentSize(NSSize(width: 720, height: 576))
+        app.video.frame = NSRect(x: 0, y: 0, width: 720, height: 576)
+        app.video.layoutSubtreeIfNeeded()
+
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 720, height: 288, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue))
+        ctx.setFillColor(CGColor(srgbRed: 0.2, green: 0.4, blue: 0.6, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 720, height: 288))
+        let field = try XCTUnwrap(ctx.makeImage())
+
+        let standard = try shaderItem("Standard")      // no frame yet: loading draws nothing
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(standard.action), to: standard.target, from: standard))
+        XCTAssertEqual(standard.state, .on)
+        XCTAssertNil(app.video.chain)
+        let deadline = Date().addingTimeInterval(60)
+        while app.video.chain == nil, Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        let chain = try XCTUnwrap(app.video.chain, "preset did not load: \(app.video.shaderState)")
+        XCTAssertEqual(chain.frameCallCount, 0)
+
+        app.handleFrame(field)
+        XCTAssertEqual(chain.frameCallCount, 1)
+        let filtered = try readPixel(app.video)
+
+        let off = try shaderItem("Off")
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(off.action), to: off.target, from: off))
+        XCTAssertNil(app.video.chain)
+        XCTAssertEqual(chain.frameCallCount, 1)
+        let plain = try readPixel(app.video)
+        XCTAssertNotEqual(filtered, plain)
+        // BGRA: the plain picture keeps 0.6 blue; the fixture shader inverts it to 0.4.
+        XCTAssertEqual(Double(plain[0]), 0.6 * 255, accuracy: 3)
+        XCTAssertEqual(Double(filtered[0]), 0.4 * 255, accuracy: 3)
     }
 
     func testFullScreenItemAndCollectionBehavior() throws {
