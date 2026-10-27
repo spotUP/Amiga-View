@@ -1,0 +1,10 @@
+[Unit]
+Description=Amiga capture box (grabber to PNG snapshots, localhost only)
+
+[Service]
+ExecStart=/usr/bin/python3 %h/amiga/camserver.py --device /dev/video0 --size 720x576 --input-format uyvy422 --channel 4 --standard PAL --fps 25 --snap-fps 1 --field-order tff --port 8090 --audio-device hw:CARD=STK1160,DEV=0
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

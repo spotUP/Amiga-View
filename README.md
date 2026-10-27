@@ -20,21 +20,21 @@ What the setup needs:
 - A real Amiga 1200 (the A1200 in this setup is at 192.168.0.74).
 - A Raspberry Pi 4 Model B running Debian 13 (trixie), with Python 3, ffmpeg and alsa-utils (arecord) installed.
 - An analog USB capture device with the STK1160 chip (USB ID 05e1:0408, "Syntek STK1160 Video Capture Device"), seen on the Pi as `/dev/video0`. It takes the picture on its S-Video input (`--channel 4`) as PAL, 720x576, uyvy422, 25 fps. It also supplies the audio: ALSA card STK1160 (`hw:CARD=STK1160,DEV=0`), s16le, 48000 Hz, stereo.
-- A video cable from the Amiga's video output to the capture device's S-Video input. TODO(user): name the exact cable or adapter between the A1200 and the capture device.
-- A PAL picture that is not scandoubled: camserver's notes say the scandoubler of the Replay board must be off for S-Video, otherwise the screen appears twice side by side. TODO(user): say whether the picture comes from the A1200's own video output or from a Replay board, and how the Amiga's audio reaches the capture device's audio input.
-- A network that connects the Mac, the Pi and the Amiga. The Pi is reachable as `amigrabber.local`. TODO(user): say whether the Pi is wired or on Wi-Fi.
-- A Synergy client on the Amiga, named "replay". TODO(user): say where the Synergy client for the Amiga comes from.
-- Deskflow on the Mac, as the Synergy server. TODO(user): give the Deskflow version.
+- A Replay board in the A1200, its S-Video output cabled to the capture device's S-Video input, and the Amiga's audio cabled to the capture device's audio input.
+- A PAL picture that is not scandoubled: the Replay board's scandoubler must be off for S-Video, otherwise the screen appears twice side by side.
+- A network that connects the Mac, the Pi and the Amiga. The Pi is reachable as `amigrabber.local`; here it is on wired Ethernet (Wi-Fi works as a fallback).
+- A Synergy client on the Amiga, named "replay". It comes with UHCTools.
+- Deskflow on the Mac, as the Synergy server (tested with Deskflow 1.27.0).
 - Optional, for Reset only: wasabid on the Amiga (installed by UP-Term) on a private network.
 
 ## Setup
 
-1. Pi: build and install the patched stk1160 kernel module. The source is in `pi/stk1160/` (out-of-tree, built for kernel 6.18.50+rpt from raspberrypi/linux stable_20260911; it repairs a field after a lost USB packet). It needs the kernel headers for the running kernel. Run `make` there, then stop the camserver service, copy `stk1160.ko` to `/lib/modules/$(uname -r)/updates/`, run `depmod -a`, run `modprobe -r stk1160 && modprobe stk1160`, and start the service again. There is no DKMS, so repeat this after every kernel upgrade. TODO(user): the Pi's `~/stk1160-build/install.sh` does these steps but is not in this repository; say whether to add it.
-2. Pi: copy `pi/camserver.py` to `~/amiga/camserver.py`. It needs only Python 3, ffmpeg and arecord. Run it as a user systemd unit, `~/.config/systemd/user/amiga-cam.service` (Restart=always, RestartSec=3, WantedBy=default.target), and enable lingering with `loginctl enable-linger` so it starts at boot without a login. The unit's ExecStart is:
+1. Pi: build and install the patched stk1160 kernel module. The source is in `pi/stk1160/` (out-of-tree, built for kernel 6.18.50+rpt from raspberrypi/linux stable_20260911; it repairs a field after a lost USB packet). It needs the kernel headers for the running kernel. Copy the folder to the Pi and run `./install.sh` in it: it runs `make`, stops the camserver service, copies `stk1160.ko` to `/lib/modules/$(uname -r)/updates/`, runs `depmod -a`, reloads the module and starts the service again (it uses sudo). There is no DKMS, so repeat this after every kernel upgrade.
+2. Pi: copy `pi/camserver.py` to `~/amiga/camserver.py`. It needs only Python 3, ffmpeg and arecord. Run it as a user systemd unit: copy `pi/amiga-cam.service` to `~/.config/systemd/user/amiga-cam.service`, run `systemctl --user enable --now amiga-cam`, and enable lingering with `loginctl enable-linger` so it starts at boot without a login. The unit's ExecStart is:
 
         /usr/bin/python3 %h/amiga/camserver.py --device /dev/video0 --size 720x576 --input-format uyvy422 --channel 4 --standard PAL --fps 25 --snap-fps 1 --field-order tff --port 8090 --audio-device hw:CARD=STK1160,DEV=0
 
-   camserver listens on 127.0.0.1 only and has no login, so it is reached through an SSH tunnel. TODO(user): the unit file itself is not in this repository; say whether to add it.
+   camserver listens on 127.0.0.1 only and has no login, so it is reached through an SSH tunnel.
 3. Mac: add a Host entry to `~/.ssh/config` that Amiga-View's tunnel uses, with a key that logs in without a password:
 
         Host amigrabber
@@ -43,8 +43,8 @@ What the setup needs:
             IdentityFile ~/.ssh/amigrabber_ed25519
 
    Check with `ssh amigrabber`.
-4. Mac: in Deskflow, add a screen named "replay" to the right of the Mac's own screen (BMS-MAC001 here). Turn the log file on (`[log] file=` in `~/Library/Deskflow/Deskflow.conf`, giving `~/deskflow.log`), because Amiga-View reads that log to see who has the input. The notes behind this setup also use `enableHeartbeat=false` in `~/Library/Deskflow/deskflow-server.conf`. TODO(user): say whether `enableHeartbeat=false` is required.
-5. Amiga: start the Synergy client with the screen name "replay", pointing at the Mac. The client reports a 680x540 screen. TODO(user): the exact client command or startup entry.
+4. Mac: in Deskflow, add a screen named "replay" to the right of the Mac's own screen (BMS-MAC001 here). Turn the log file on (`[log] file=` in `~/Library/Deskflow/Deskflow.conf`, giving `~/deskflow.log`), because Amiga-View reads that log to see who has the input. This setup runs with `enableHeartbeat=false` in `~/Library/Deskflow/deskflow-server.conf`; whether that is required has not been tested.
+5. Amiga: start the UHCTools Synergy client with the screen name "replay", pointing at the Mac. The client reports a 680x540 screen.
 6. Amiga, optional: install wasabid from UP-Term's kit (tick wasabid in Install). It installs wasabid in `C:`, the key in `ENVARC:wasabi.key`, a block in `S:User-Startup`, and listens on port 1234. Use it only on a private network and never forward port 1234. Copy the key to `~/.config/up-term/replay-wasabi.key` on the Mac.
 7. Mac: build and open Amiga-View (see Build and run). Open Amiga-View > Settings... and set the Amiga address (192.168.0.74) and port (1234), then enter the wasabid key. The picture needs no setting: the app starts the tunnel by itself.
 8. Check: the status line shows the frame rate, the picture is the Amiga's screen, and moving the pointer across the right edge of the Mac screen gives the Amiga the keyboard and mouse.
