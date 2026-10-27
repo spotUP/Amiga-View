@@ -1,6 +1,7 @@
 import AppKit
 import AmigaViewCore
 import LibrashaderBridge
+import Metal
 
 /// Shows the newest frame, aspect-fitted, on a Metal layer (see PictureRenderer), plus a status line.
 final class VideoView: NSView {
@@ -15,6 +16,8 @@ final class VideoView: NSView {
         // Not framebuffer-only: tests read the drawable back.
         layer.framebufferOnly = false
         layer.isOpaque = true
+        // The picture is sRGB; without a colorspace the layer is not colour matched and looks oversaturated on wide-gamut displays.
+        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         if let renderer { layer.device = renderer.device }
         label.textColor = .white
         label.backgroundColor = NSColor.black.withAlphaComponent(0.6)
@@ -91,20 +94,29 @@ final class VideoView: NSView {
     /// Test sentinel and measurement hook: the loaded chain, nil while off, loading or failed.
     private(set) var chain: LBFilterChain?
     private var loadGeneration = 0
+    /// The newest wanted generation, readable from the load queue so a queued load that is stale skips its compile.
+    private let wantedGeneration = WantedGeneration()
+    /// Compiles a preset; tests replace it to count compiles.
+    var chainLoader: (String, MTLCommandQueue) throws -> LBFilterChain = { try LBFilterChain(presetPath: $0, queue: $1) }
     /// A serial queue: the 15 s cold load must not run beside another load of the same process.
     private let loadQueue = DispatchQueue(label: "CRT shader load", qos: .userInitiated)
 
     /// The preset to filter the picture with; nil shows the plain picture. Loads on a background
-    /// queue and draws plain meanwhile; a result for a preset that is no longer wanted is dropped.
+    /// queue and draws plain meanwhile; a load for a preset that is no longer wanted is skipped, or
+    /// dropped when already running. Choosing the preset that is active, loading or loaded is a no-op;
+    /// a failed one is tried again.
     var shaderPreset: URL? {
         didSet {
+            if shaderPreset == oldValue { if case .failed = shaderState {} else { return } }
             loadGeneration += 1
+            wantedGeneration.set(loadGeneration)
             chain = nil
             guard let url = shaderPreset, let renderer else { shaderState = .off; draw(); return }
             shaderState = .loading
-            let generation = loadGeneration, queue = renderer.queue
+            let generation = loadGeneration, queue = renderer.queue, wanted = wantedGeneration, load = chainLoader
             loadQueue.async { [weak self] in
-                let result = Result { try LBFilterChain(presetPath: url.path, queue: queue) }
+                guard wanted.value == generation else { return }
+                let result = Result { try load(url.path, queue) }
                 DispatchQueue.main.async {
                     guard let self, generation == self.loadGeneration else { return }
                     switch result {
@@ -134,7 +146,17 @@ final class VideoView: NSView {
         ViewGeometry.pictureRect(in: bounds.size, scale: scale, crop: crop, integerScaling: integerScaling)
     }
 
+    /// Keeps drawableSize equal to bounds * scale, so no frame is drawn with a rect from the new
+    /// bounds into a drawable of the old size.
+    private func syncDrawableSize() {
+        let layer = metalLayer
+        layer.contentsScale = scale
+        let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        if layer.drawableSize != size { layer.drawableSize = size }
+    }
+
     private func draw() {
+        syncDrawableSize()
         guard let renderer, let image else { return }
         renderer.render(field: image, crop: crop, rect: pictureRect, chain: chain, frameCount: frameCount, to: metalLayer)
     }
@@ -150,11 +172,16 @@ final class VideoView: NSView {
 
     override func layout() {
         super.layout()
-        let layer = metalLayer
-        layer.contentsScale = scale
-        layer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
         draw()
         label.sizeToFit()
         label.frame.origin = NSPoint(x: 8, y: 8)
     }
+}
+
+/// An integer shared between the main queue (writer) and the shader load queue (reader).
+private final class WantedGeneration {
+    private let lock = NSLock()
+    private var current = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return current }
+    func set(_ v: Int) { lock.lock(); current = v; lock.unlock() }
 }
