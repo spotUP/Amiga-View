@@ -16,4 +16,21 @@ final class EdgeGuardTests: XCTestCase {
         XCTAssertGreaterThan(asked, 0)
         XCTAssertEqual(window.frame.maxX, 1800 - 16)
     }
+
+    /// Full screen covers the right edge by design; moving that window shifted the picture 16 points
+    /// left. The guard stands down until full screen ends, then clears the edge again.
+    func testFullScreenWindowIsNotMovedOffTheEdge() {
+        let guardian = EdgeGuard()
+        guardian.desktop = { CGRect(x: 0, y: 0, width: 1800, height: 1169) }
+        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 720, height: 576),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.delegate = guardian
+        guardian.windowWillEnterFullScreen(Notification(name: NSWindow.willEnterFullScreenNotification, object: window))
+        window.setFrame(NSRect(x: 0, y: 0, width: 1800, height: 1169), display: false)
+        XCTAssertEqual(window.frame.minX, 0)
+        XCTAssertEqual(window.frame.maxX, 1800)
+        guardian.windowDidExitFullScreen(Notification(name: NSWindow.didExitFullScreenNotification, object: window))
+        XCTAssertEqual(window.frame.maxX, 1800 - 16)
+    }
 }
