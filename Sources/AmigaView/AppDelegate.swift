@@ -40,7 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let fullScreenHint = "Press Esc or Control-Command-F to leave full screen"
     var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
-    private lazy var deskflow = DeskflowMonitor(path: DeskflowLog.path(), clock: { ProcessInfo.processInfo.systemUptime },
+    /// Replaced by tests with a monitor on a temp log.
+    lazy var deskflow = DeskflowMonitor(path: DeskflowLog.path(), clock: { ProcessInfo.processInfo.systemUptime },
                                                 trusted: { [weak self] in self?.accessibilityTrusted ?? false })
     /// `--stats`: print frames decoded and drawn every 5 s to stderr, to measure the rate the app shows.
     private let printStats = CommandLine.arguments.contains("--stats")
@@ -206,29 +207,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshStatus() {
+    func refreshStatus() {
         deskflow.poll()
         video.amigaHasInput = deskflow.amigaHasInput
+        // The recording line sits above whatever else is shown, so a running recording is never hidden.
+        let recording = recorder.map { _ in "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt))" }
+        video.status = [recording, statusMessage()].compactMap { $0 }.joined(separator: "\n")
+    }
+
+    private func statusMessage() -> String {
         if let f = flash {
-            if ProcessInfo.processInfo.systemUptime < f.until { video.status = f.text; return }
+            if ProcessInfo.processInfo.systemUptime < f.until { return f.text }
             flash = nil
         }
-        if let text = deskflow.overrideStatus { video.status = text; return }
-        if SynergySwitch.isEnabled() && !accessibilityTrusted {
-            video.status = SynergySwitch.untrustedStatus
-            return
-        }
-        let now = Date.timeIntervalSinceReferenceDate
-        let fps = fpsMeter.fps(at: now)
-        let recording = recorder == nil ? "" : "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt)) - "
+        if let text = deskflow.overrideStatus { return text }
+        if SynergySwitch.isEnabled() && !accessibilityTrusted { return SynergySwitch.untrustedStatus }
+        let fps = fpsMeter.fps(at: Date.timeIntervalSinceReferenceDate)
         if let last = lastFrame, Date().timeIntervalSince(last) < 3 {
             let mode = client?.usingSnapshotFallback == true ? " (snapshot polling)" : ""
-            video.status = recording + String(format: "%.0f FPS%@", fps, mode)
-        } else if lastFrame != nil {
-            video.status = recording + "No signal"
-        } else {
-            video.status = recording + baseStatus
+            return String(format: "%.0f FPS%@", fps, mode)
         }
+        return lastFrame != nil ? "No signal" : baseStatus
     }
 
     // MARK: Window and menu

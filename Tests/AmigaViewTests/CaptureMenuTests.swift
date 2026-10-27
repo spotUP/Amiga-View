@@ -100,6 +100,29 @@ final class CaptureMenuTests: XCTestCase {
         XCTAssertEqual(size, CGSize(width: 720, height: 576))
         XCTAssertEqual(seconds, 0.35, accuracy: 0.25)
     }
+
+    /// The Deskflow status used to replace the whole status line, hiding a running recording.
+    func testRecordingLineStaysVisibleWhileAmigaHasInput() throws {
+        let log = dir.appendingPathComponent("deskflow.log").path
+        try "[t] INFO: switch from \"BMS-MAC001\" to \"replay\" at 0,539\n".write(toFile: log, atomically: true, encoding: .utf8)
+        app.deskflow = DeskflowMonitor(path: log, clock: { 100 }, trusted: { true }, postRelease: {})
+        try invoke("Start Recording")
+        app.refreshStatus()
+        let lines = app.video.status.components(separatedBy: "\n")
+        XCTAssertEqual(lines.count, 2, app.video.status)
+        XCTAssertTrue(lines[0].hasPrefix("Recording 00:0"), lines[0])
+        XCTAssertEqual(lines[1], DeskflowMonitor.amigaStatus)
+
+        // Both lines are drawn: the label is two lines tall.
+        let label = try XCTUnwrap(app.video.subviews.compactMap { $0 as? NSTextField }.first)
+        app.video.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(label.frame.height, label.font!.boundingRectForFont.height * 1.5)
+
+        let finished = expectation(description: "finished")
+        app.recordingFinished = { _ in finished.fulfill() }
+        try invoke("Stop Recording")
+        wait(for: [finished], timeout: 10)
+    }
 }
 
 private extension CGImage {

@@ -20,6 +20,7 @@ final class VideoView: NSView {
         label.backgroundColor = NSColor.black.withAlphaComponent(0.6)
         label.drawsBackground = true
         label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        label.maximumNumberOfLines = 0
         addSubview(label)
     }
 
@@ -118,7 +119,7 @@ final class VideoView: NSView {
     }
 
     var status: String = "" {
-        didSet { label.stringValue = " " + status + " "; needsLayout = true }
+        didSet { label.stringValue = status.split(separator: "\n").map { " \($0) " }.joined(separator: "\n"); needsLayout = true }
     }
 
     override func layout() {
