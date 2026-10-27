@@ -50,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var resetEnvironment: [String: String]?
     /// Runs on the main queue with the status text when a reset finishes; replaced by tests.
     var resetFinished: ((String) -> Void)?
+    /// Where a wasabid key typed in Settings is kept; tests use their own item.
+    var keychain = Keychain.wasabi
+    private(set) var settingsWindow: SettingsWindowController?
+    static let settingsSavedStatus = "Settings saved"
     static let fullScreenHint = "Press Esc or Control-Command-F to leave full screen"
     var accessibilityTrusted = false
     private var lastSwitch: TimeInterval?
@@ -170,10 +174,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func resetAmiga() {
         guard confirmReset() else { return }
         showFlash(AmigaReset.startedStatus)
-        AmigaReset.load(from: defaults).run(script: AmigaReset.scriptURL(), environment: resetEnvironment) { [weak self] text in
+        AmigaReset.load(from: defaults, keychain: keychain).run(script: AmigaReset.scriptURL(), environment: resetEnvironment) { [weak self] text in
             self?.showFlash(text)
             self?.resetFinished?(text)
         }
+    }
+
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            let controller = SettingsWindowController(defaults: defaults, keychain: keychain)
+            controller.saved = { [weak self] in self?.showFlash(Self.settingsSavedStatus) }
+            settingsWindow = controller
+        } else {
+            settingsWindow?.load()
+        }
+        settingsWindow?.showWindow(nil)
+        settingsWindow?.window?.makeKeyAndOrderFront(nil)
     }
 
     @objc private func toggleRecording() {
@@ -284,6 +300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Settings...", action: #selector(openSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Amiga-View", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 

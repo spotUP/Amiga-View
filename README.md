@@ -20,6 +20,14 @@ On launch Amiga-View checks whether `localhost:8090` answers. If not, it starts
     scripts/bundle.sh      # release build into build/Amiga-View.app, with the icon drawn by scripts/make-icon.swift
     open build/Amiga-View.app
 
+### Signing
+
+Run `scripts/make-signing-identity.sh` once per Mac. It creates a free, self-signed code-signing identity, "Amiga-View Dev", in the login keychain; no Apple developer account is needed. `scripts/bundle.sh` signs with it when it exists, and ad hoc otherwise. With a stable signature, the Accessibility grant and the stored wasabid key keep working after a rebuild; with an ad-hoc signature macOS asks for both again after every build.
+
+A downloaded build is not notarized, so Gatekeeper blocks the first launch. Open it once, then allow it in System Settings, Privacy and Security, "Open Anyway" (on macOS 15, right-click Open no longer skips the check). Or remove the quarantine flag:
+
+    xattr -dr com.apple.quarantine /Applications/Amiga-View.app
+
 ## Sound
 
 Amiga-View plays `/audio.pcm` on the default output. It keeps about 60 ms buffered so the sound stays with the picture: after a gap it waits until 60 ms are buffered again, and a backlog over 150 ms is dropped. When camserver serves no audio, it retries quietly with the same backoff as the video.
@@ -32,7 +40,13 @@ prints every 5 s to stderr: frames drawn per second, audio bytes received, audio
 
 ## Settings
 
-Stored in UserDefaults for `com.spotup.amiga-view`; change with `defaults write`:
+Amiga-View > Settings... (cmd-,) sets where the Amiga's wasabid listens and its key, for Reset:
+
+- Amiga address and Port: the A1200's address (default 192.168.0.74) and wasabid's port (default 1234). Saved as `amigaHost` and `amigaPort`.
+- wasabid key: typed into a hidden field and stored in the login keychain (item "com.spotup.amiga-view.wasabi"), never in the defaults. The field is always empty when the window opens; leave it empty to keep the stored key. "Forget Stored Key" deletes it.
+- Key file: used when no key is stored (`amigaKeyFile`, default `~/.config/up-term/replay-wasabi.key`, which UP-Term writes).
+
+The stream settings have no window yet; they are stored in UserDefaults for `com.spotup.amiga-view` and changed with `defaults write`:
 
     defaults write com.spotup.amiga-view host localhost
     defaults write com.spotup.amiga-view port -int 8090
@@ -41,6 +55,8 @@ Stored in UserDefaults for `com.spotup.amiga-view`; change with `defaults write`
 The tunnel is only started when `host` is `localhost` or `127.0.0.1` and `via` is not empty. Window position and size are remembered; "Always on Top" is remembered too.
 
 ## Menu
+
+Amiga-View: Settings... (cmd-,; see Settings).
 
 Amiga: Reset Amiga... (see Reset).
 
@@ -63,14 +79,11 @@ The File menu saves what the window shows.
 
 Amiga > Reset Amiga... asks first, then reboots the A1200 through wasabid, the daemon running on it (its REBOOT verb calls ColdReboot). Sending Ctrl-Amiga-Amiga over Synergy does not work: that reset is wired in the A1200's keyboard hardware, and keys that come over the network never pass through it.
 
+wasabid is optional: without it everything else works, and only Reset fails. It needs wasabid running on the A1200 (UP-Term installs it, see its kit's Install) and `/usr/bin/python3` on the Mac (part of the Command Line Tools; macOS offers to install them on first use).
+
 The app runs the vendored wasabi client (`Resources/wasabi/wasabi.py`, copied into the app bundle) with `/usr/bin/python3`. It always names the host, because without one wasabi searches the network and also finds wasabid inside emulators on this Mac. The status line shows "Resetting the Amiga", then "Amiga is rebooting" or "Reset failed: reason".
 
-    defaults write com.spotup.amiga-view amigaHost 192.168.0.74
-    defaults write com.spotup.amiga-view amigaPort -int 1234
-
-    defaults write com.spotup.amiga-view amigaKeyFile ~/.config/up-term/replay-wasabi.key
-
-The key is the first line of UP-Term's key file (`amigaKeyFile`, default `~/.config/up-term/replay-wasabi.key`): UP-Term installs wasabid on the Amiga with that key, while wasabi's own config can hold an older one. It goes to wasabi in `WASABI_KEY`, never on the command line.
+Set the address, port and key in Settings. The key stored there wins; without one, the app reads the first line of the key file. UP-Term installs wasabid on the Amiga with the key in that file, while wasabi's own config can hold an older one. The key goes to wasabi in `WASABI_KEY`, never on the command line.
 
 ## With Deskflow
 

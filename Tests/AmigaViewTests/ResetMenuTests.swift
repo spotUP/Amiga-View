@@ -3,8 +3,9 @@ import XCTest
 @testable import AmigaView
 @testable import AmigaViewCore
 
-/// Amiga > Reset Amiga... end to end: the menu item runs the bundled wasabi client against the
-/// mock wasabid from wasabi's own test suite, which logs the REBOOT it receives.
+/// Amiga > Reset Amiga... and Amiga-View > Settings... end to end: the menu item runs the bundled
+/// wasabi client against the mock wasabid from wasabi's own test suite, which logs the REBOOT it
+/// receives. Each test has its own Keychain item, so the user's stored key is never read.
 @MainActor
 final class ResetMenuTests: XCTestCase {
     private var app: AppDelegate!
@@ -21,12 +22,15 @@ final class ResetMenuTests: XCTestCase {
         app = AppDelegate()
         app.defaults = UserDefaults(suiteName: suite)!
         app.frameAutosaveName = nil
+        app.keychain = Keychain(service: "com.spotup.amiga-view.test-" + suite, account: "wasabid")
         app.buildWindow()
         app.buildMenu()
     }
 
     override func tearDown() {
         mock?.terminate(); mock?.waitUntilExit()
+        app.keychain.delete()
+        app.settingsWindow?.close()
         UserDefaults(suiteName: suite)!.removePersistentDomain(forName: suite)
         try? FileManager.default.removeItem(at: dir)
     }
@@ -126,6 +130,72 @@ final class ResetMenuTests: XCTestCase {
         app.resetFinished = { result = $0; finished.fulfill() }
         try invoke("Reset Amiga...")
         wait(for: [finished], timeout: 5)
-        XCTAssertEqual(result, "Reset failed: no key in \(keyFile.path)")
+        XCTAssertEqual(result, "Reset failed: no key in Settings or in \(keyFile.path)")
+    }
+
+    /// The Settings window is how the address and key reach the reset: start with a wrong address
+    /// and a wrong key file, fix both in Settings, and the next reset reaches the mock.
+    func testSettingsWindowSetsAddressAndKeyForReset() throws {
+        try startMock()
+        let port = app.defaults.integer(forKey: "amigaPort")
+        app.defaults.set("192.0.2.1", forKey: "amigaHost")
+        app.defaults.set(1, forKey: "amigaPort")
+        try "wrong\n".write(to: keyFile, atomically: true, encoding: .utf8)
+
+        try invoke("Settings...")
+        let settings = try XCTUnwrap(app.settingsWindow)
+        XCTAssertTrue(settings.window?.isVisible ?? false)
+        XCTAssertEqual(settings.hostField.stringValue, "192.0.2.1")
+        XCTAssertEqual(settings.portField.stringValue, "1")
+        XCTAssertEqual(settings.keyFileField.stringValue, keyFile.path)
+        XCTAssertEqual(settings.keyField.stringValue, "")
+        XCTAssertFalse(settings.forgetButton.isEnabled)
+
+        settings.hostField.stringValue = "127.0.0.1"
+        settings.portField.stringValue = String(port)
+        settings.keyField.stringValue = "testkey"
+        settings.saveButton.performClick(nil)
+        XCTAssertFalse(settings.window?.isVisible ?? true)
+        XCTAssertEqual(app.video.status, AppDelegate.settingsSavedStatus)
+        XCTAssertEqual(app.defaults.string(forKey: "amigaHost"), "127.0.0.1")
+        XCTAssertEqual(app.defaults.integer(forKey: "amigaPort"), port)
+        XCTAssertEqual(app.keychain.read(), "testkey")
+
+        app.confirmReset = { true }
+        let finished = expectation(description: "finished")
+        var result = ""
+        app.resetFinished = { result = $0; finished.fulfill() }
+        try invoke("Reset Amiga...")
+        wait(for: [finished], timeout: 20)
+        XCTAssertEqual(result, "Amiga is rebooting")
+        XCTAssertTrue(log().contains("REBOOT requested"), log())
+    }
+
+    func testSettingsRefusesABadPortAndKeepsTheOldValues() throws {
+        try invoke("Settings...")
+        let settings = try XCTUnwrap(app.settingsWindow)
+        settings.hostField.stringValue = "10.0.0.9"
+        settings.portField.stringValue = "70000"
+        settings.keyField.stringValue = "k"
+        settings.saveButton.performClick(nil)
+        XCTAssertEqual(settings.errorLabel.stringValue, "Port must be a number from 1 to 65535")
+        XCTAssertTrue(settings.window?.isVisible ?? false)
+        XCTAssertNil(app.defaults.string(forKey: "amigaHost"))
+        XCTAssertNil(app.keychain.read())
+    }
+
+    func testEmptyKeyFieldKeepsTheStoredKeyAndForgetRemovesIt() throws {
+        XCTAssertNil(app.keychain.write("stored"))
+        try invoke("Settings...")
+        let settings = try XCTUnwrap(app.settingsWindow)
+        XCTAssertTrue(settings.forgetButton.isEnabled)
+        XCTAssertEqual(settings.keyField.stringValue, "")
+        settings.saveButton.performClick(nil)
+        XCTAssertEqual(app.keychain.read(), "stored")
+
+        try invoke("Settings...")
+        settings.forgetButton.performClick(nil)
+        XCTAssertNil(app.keychain.read())
+        XCTAssertFalse(settings.forgetButton.isEnabled)
     }
 }
