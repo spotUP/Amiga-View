@@ -5,7 +5,7 @@ import Metal
 import QuartzCore
 
 /// Draws the Amiga field into a CAMetalLayer: the cropped field is uploaded at its native size
-/// (no CPU line doubling) into one reused texture, then either blitted to the drawable or sent
+/// (no CPU line doubling) into one of a ring of reused textures, then either blitted to the drawable or sent
 /// through a librashader chain first. All calls come from the main thread: the chain is not
 /// thread safe.
 final class PictureRenderer {
@@ -14,7 +14,14 @@ final class PictureRenderer {
     private let pipeline: MTLRenderPipelineState
     private let nearest: MTLSamplerState
     private let linear: MTLSamplerState
-    private var source: MTLTexture?
+    /// Frames that may be on the GPU at once; each reads its own source texture, so the CPU never
+    /// overwrites one the GPU still samples. A permit is taken per frame and given back when its command buffer completes.
+    static let framesInFlight = 3
+    private var sources = [MTLTexture?](repeating: nil, count: framesInFlight)
+    private var nextSource = 0
+    private let inFlight = DispatchSemaphore(value: framesInFlight)
+    /// The source texture the last frame sampled (tests check the ring).
+    private(set) var lastSource: MTLTexture?
     private var pixels = [UInt8]()
     private var offscreen: MTLTexture?
 
@@ -52,16 +59,17 @@ final class PictureRenderer {
         (self.device, self.queue, self.pipeline, self.nearest, self.linear) = (device, queue, pipeline, nearest, linear)
     }
 
-    /// Copies `crop` (field pixels) of `field` into the reused source texture.
+    /// Copies `crop` (field pixels) of `field` into the next texture of the source ring.
     private func upload(_ field: CGImage, crop: CGRect) -> MTLTexture? {
         let r = crop.integral.intersection(CGRect(x: 0, y: 0, width: field.width, height: field.height))
         guard !r.isNull, r.width > 0, r.height > 0, let part = field.cropping(to: r) else { return nil }
         let (w, h) = (part.width, part.height)
-        if source?.width != w || source?.height != h {
-            source = makeTexture(w, h, usage: .shaderRead, storage: .shared)
-            pixels = [UInt8](repeating: 0, count: w * h * 4)
+        if pixels.count != w * h * 4 { pixels = [UInt8](repeating: 0, count: w * h * 4) }
+        let slot = nextSource
+        if sources[slot]?.width != w || sources[slot]?.height != h {
+            sources[slot] = makeTexture(w, h, usage: .shaderRead, storage: .shared)
         }
-        guard let source else { return nil }
+        guard let source = sources[slot] else { return nil }
         let drawn = pixels.withUnsafeMutableBytes { buf -> Bool in
             guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -73,6 +81,7 @@ final class PictureRenderer {
         }
         guard drawn else { return nil }
         source.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: pixels, bytesPerRow: w * 4)
+        nextSource = (slot + 1) % Self.framesInFlight
         return source
     }
 
@@ -89,8 +98,14 @@ final class PictureRenderer {
     /// nothing was drawn.
     @discardableResult
     func render(field: CGImage, crop: CGRect, rect: CGRect, chain: LBFilterChain?, frameCount: UInt, to layer: CAMetalLayer) -> Bool {
-        guard rect.width > 0, rect.height > 0, layer.drawableSize.width >= 1, layer.drawableSize.height >= 1, let src = upload(field, crop: crop),
+        guard rect.width > 0, rect.height > 0, layer.drawableSize.width >= 1, layer.drawableSize.height >= 1,
               let cb = queue.makeCommandBuffer(), let drawable = layer.nextDrawable() else { return false }
+        // A stalled GPU gives up the frame after a second instead of freezing the main thread.
+        guard inFlight.wait(timeout: .now() + 1) == .success else { return false }
+        var committed = false
+        defer { if !committed { inFlight.signal() } }
+        guard let src = upload(field, crop: crop) else { return false }
+        lastSource = src
         var picture = src, filter = nearest
         if let chain {
             let size = ViewGeometry.chainSize(for: rect.size)
@@ -116,6 +131,8 @@ final class PictureRenderer {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cb.present(drawable)
+        cb.addCompletedHandler { [inFlight] _ in inFlight.signal() }
+        committed = true
         cb.commit()
         lastTexture = drawable.texture
         lastCommandBuffer = cb
