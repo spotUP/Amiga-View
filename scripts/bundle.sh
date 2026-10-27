@@ -28,3 +28,10 @@ else
     codesign --force --sign - "$APP"
 fi
 echo "Built $APP"
+if [ "${1:-}" = "--release" ]; then
+    VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)
+    ZIP="build/Amiga-View-$VERSION.zip"
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    echo "Packed $ZIP"
+fi
