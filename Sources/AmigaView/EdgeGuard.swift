@@ -31,6 +31,12 @@ final class EdgeGuard: NSObject, NSWindowDelegate {
         if let window = notification.object as? NSWindow { apply(to: window) }
     }
 
+    /// Not about the edge, but this is the window's delegate: in full screen the toolbar hides
+    /// with the menu bar and comes back with it at the top of the screen, so only the picture shows.
+    func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposed: NSApplication.PresentationOptions = []) -> NSApplication.PresentationOptions {
+        proposed.union([.autoHideToolbar, .autoHideMenuBar])
+    }
+
     func windowWillEnterFullScreen(_ notification: Notification) {
         inFullScreen = true
     }

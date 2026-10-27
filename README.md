@@ -68,6 +68,10 @@ View: Actual Size (720x576), Double Size (1440x1152), Always on Top, Crop Oversc
 - Enter Full Screen: standard macOS full screen. Press Esc or ctrl-cmd-F to leave it (the status line says so for 3 s on entering); keys only reach the Mac while it has the input. Clicks within 16 points of the right edge of the desktop do not switch Synergy, because Deskflow returns the pointer there.
 - Each option is stored in the defaults (`picture.cropOverscan`, `picture.integerScaling`, `picture.scanlines`) and survives a restart.
 
+## Toolbar
+
+The window's toolbar has Save Snapshot, Start/Stop Recording, Sound, Enter Full Screen, Reset Amiga and Settings; each runs the same action as its menu item, and the Recording and Sound buttons show the current state. Right-click the toolbar to customise it. In full screen it hides with the menu bar and shows when the pointer touches the top edge.
+
 ## Snapshot and recording
 
 The File menu saves what the window shows.

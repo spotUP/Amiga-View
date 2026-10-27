@@ -64,6 +64,36 @@ final class CaptureMenuTests: XCTestCase {
         XCTAssertEqual(app.window.tabbingMode, .disallowed)
     }
 
+    /// The toolbar runs the same actions as the menus and shows their state; in full screen it
+    /// hides with the menu bar.
+    func testToolbarButtonsRunTheMenuActions() throws {
+        let toolbar = try XCTUnwrap(app.window.toolbar)
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), AppDelegate.toolbarItems)
+        func click(_ id: NSToolbarItem.Identifier) throws -> NSToolbarItem {
+            let i = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier == id })
+            XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(i.action), to: i.target, from: i))
+            return i
+        }
+
+        let record = try click(.record)
+        XCTAssertNotNil(app.recorder)
+        XCTAssertEqual(record.label, "Stop Recording")
+        XCTAssertNoThrow(try item("Stop Recording"))
+        feedFrames()
+        let finished = expectation(description: "finished")
+        app.recordingFinished = { _ in finished.fulfill() }
+        _ = try click(.record)
+        wait(for: [finished], timeout: 10)
+        XCTAssertNil(app.recorder)
+        XCTAssertEqual(record.label, "Start Recording")
+
+        _ = try click(.snapshot)
+        XCTAssertEqual(files("png").count, 1)
+
+        let options = try XCTUnwrap(app.window.delegate?.window?(app.window, willUseFullScreenPresentationOptions: [.fullScreen]))
+        XCTAssertTrue(options.contains(.autoHideToolbar))
+    }
+
     func testSnapshotWritesThePicture() throws {
         try invoke("Save Snapshot")   // no frame yet
         XCTAssertTrue(files("png").isEmpty)

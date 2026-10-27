@@ -161,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
     }
 
-    @objc private func saveSnapshot() {
+    @objc func saveSnapshot() {
         guard let field = video.image else { showFlash("No picture to save"); return }
         guard let image = ViewGeometry.displayImage(from: field, crop: currentCrop), let png = CaptureFile.png(image) else {
             showFlash("Snapshot failed"); return
@@ -171,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         catch { showFlash("Snapshot failed: \(error.localizedDescription)") }
     }
 
-    @objc private func resetAmiga() {
+    @objc func resetAmiga() {
         guard confirmReset() else { return }
         showFlash(AmigaReset.startedStatus)
         AmigaReset.load(from: defaults, keychain: keychain).run(script: AmigaReset.scriptURL(), environment: resetEnvironment) { [weak self] text in
@@ -180,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func openSettings() {
+    @objc func openSettings() {
         if settingsWindow == nil {
             let controller = SettingsWindowController(defaults: defaults, keychain: keychain)
             controller.saved = { [weak self] in self?.showFlash(Self.settingsSavedStatus) }
@@ -192,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow?.window?.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func toggleRecording() {
+    @objc func toggleRecording() {
         if let r = recorder { stopRecording(r) } else { startRecording() }
     }
 
@@ -204,6 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recordingStartedAt = ProcessInfo.processInfo.systemUptime
             audio?.onPCM = { r.push(pcm: $0) }
             recordItem.title = "Stop Recording"
+            updateToolbar()
         } catch { showFlash("Recording failed: \(error.localizedDescription)") }
     }
 
@@ -211,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder = nil
         audio?.onPCM = nil
         recordItem.title = "Start Recording"
+        updateToolbar()
         showFlash("Saving \(r.url.lastPathComponent)")
         r.finish { [weak self] in
             DispatchQueue.main.async {
@@ -280,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.initialFirstResponder = video
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.isReleasedWhenClosed = false
+        buildToolbar()
         window.tabbingMode = .disallowed
         if let name = frameAutosaveName {
             if !window.setFrameUsingName(name) { window.center() }
@@ -384,10 +387,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         synergyItem.state = on ? .on : .off
     }
 
-    @objc private func toggleSound() {
+    @objc func toggleSound() {
         let on = !AudioStreamClient.isEnabled()
         AudioStreamClient.setEnabled(on)
         soundItem.state = on ? .on : .off
+        updateToolbar()
         if on { startAudio() } else { stopAudio() }
     }
 
