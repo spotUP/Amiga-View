@@ -112,6 +112,8 @@ final class CaptureMenuTests: XCTestCase {
         XCTAssertEqual(lines.count, 2, app.video.status)
         XCTAssertTrue(lines[0].hasPrefix("Recording 00:0"), lines[0])
         XCTAssertEqual(lines[1], DeskflowMonitor.amigaStatus)
+        // The status text is the only sign: the video has no border (it was cut off in full screen).
+        XCTAssertEqual(app.video.layer?.borderWidth ?? 0, 0)
 
         // Both lines are drawn: the label is two lines tall.
         let label = try XCTUnwrap(app.video.subviews.compactMap { $0 as? NSTextField }.first)

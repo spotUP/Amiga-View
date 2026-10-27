@@ -247,7 +247,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func refreshStatus() {
         deskflow.poll()
-        video.amigaHasInput = deskflow.amigaHasInput
         // The recording line sits above whatever else is shown, so a running recording is never hidden.
         let recording = recorder.map { _ in "Recording \(CaptureFile.clock(ProcessInfo.processInfo.systemUptime - recordingStartedAt))" }
         video.status = [recording, statusMessage()].compactMap { $0 }.joined(separator: "\n")

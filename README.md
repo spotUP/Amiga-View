@@ -91,7 +91,7 @@ Deskflow on this Mac has the screen "replay" to the right of BMS-MAC001; the Syn
 
 ### Who has the input
 
-Amiga-View follows the Deskflow server log (`~/deskflow.log`, or the path in the `deskflowLog` default). At start it reads the last 64 KB to learn who has the input (the newest `switch` line), then follows the end. While "replay" has the keyboard and mouse, the video gets a border in the system accent colour and the status line reads "Amiga has keyboard and mouse - leave off the left edge". Both go away when the input is back on the Mac.
+Amiga-View follows the Deskflow server log (`~/deskflow.log`, or the path in the `deskflowLog` default). At start it reads the last 64 KB to learn who has the input (the newest `switch` line), then follows the end. While "replay" has the keyboard and mouse, the status line reads "Amiga has keyboard and mouse - leave off the left edge". The text goes away when the input is back on the Mac.
 
 Deskflow sometimes believes a mouse button is held and then refuses to switch screens (it logs `locked by mouse buttonID: 0` over and over). When the log shows 3 such lines within 2 seconds while the Amiga has the input, and Accessibility is granted, Amiga-View posts one left mouseUp (at most once per 2 s) and shows "Released a stuck mouse button" for 3 s. This mitigates a Deskflow state bug whose root cause is still open.
 

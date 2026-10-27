@@ -63,14 +63,6 @@ final class VideoView: NSView {
         }
     }
 
-    /// Accent-coloured border while the Amiga has the input.
-    var amigaHasInput = false {
-        didSet {
-            layer?.borderColor = NSColor.controlAccentColor.cgColor
-            layer?.borderWidth = amigaHasInput ? 4 : 0
-        }
-    }
-
     /// The part of the field shown, in field pixels (see ViewGeometry.cropRect).
     var crop = ViewGeometry.fullField {
         didSet { applyPicture() }
